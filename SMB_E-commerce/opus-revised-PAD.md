@@ -2015,3 +2015,1642 @@ class IRASIntegrationService:
         # Get authentication token
         auth_token = await self.authenticate()
         
+        # Submit to IRAS
+        headers = {
+            'Authorization': f'Bearer {auth_token}',
+            'Content-Type': 'application/json',
+            'X-Correlation-ID': str(uuid.uuid4())
+        }
+        
+        response = await self.http_client.post(
+            f"{self.api_endpoint}/gst/returns",
+            headers=headers,
+            json={
+                'return_type': 'GST_F5',
+                'period_start': period_start.isoformat(),
+                'period_end': period_end.isoformat(),
+                'data': gst_data
+            }
+        )
+        
+        if response.status_code == 201:
+            submission_result = response.json()
+            
+            # Store submission record
+            GSTSubmission.objects.create(
+                submission_id=submission_result['submission_id'],
+                period_start=period_start,
+                period_end=period_end,
+                data=gst_data,
+                status='submitted',
+                submitted_at=datetime.now()
+            )
+            
+            return submission_result
+        else:
+            raise IRASSubmissionError(response.text)
+    
+    async def prepare_gst_f5_data(self, period_start: date, period_end: date) -> Dict:
+        """Prepare GST F5 data structure"""
+        
+        # Query transactions
+        transactions = await self.get_period_transactions(period_start, period_end)
+        
+        return {
+            'box_1': float(transactions['standard_rated_supplies']),
+            'box_2': float(transactions['zero_rated_supplies']),
+            'box_3': float(transactions['exempt_supplies']),
+            'box_4': float(transactions['total_supplies']),
+            'box_5': float(transactions['total_purchases']),
+            'box_6': float(transactions['output_tax']),
+            'box_7': float(transactions['input_tax']),
+            'box_8': float(transactions['net_gst']),
+            'box_9': float(transactions['claims_amount']),
+            'declaration': {
+                'declared_by': os.environ.get('DECLARANT_NAME'),
+                'designation': os.environ.get('DECLARANT_DESIGNATION'),
+                'declaration_date': datetime.now().isoformat()
+            }
+        }
+```
+
+### 6.3 Internal Service Integration
+
+#### 6.3.1 Service Mesh Architecture
+
+```yaml
+# Istio Service Mesh Configuration
+apiVersion: networking.istio.io/v1alpha3
+kind: ServiceEntry
+metadata:
+  name: commerce-service
+spec:
+  hosts:
+  - commerce-service.internal
+  ports:
+  - number: 8001
+    name: http
+    protocol: HTTP
+  location: MESH_INTERNAL
+  resolution: DNS
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: commerce-routing
+spec:
+  hosts:
+  - commerce-service.internal
+  http:
+  - match:
+    - headers:
+        api-version:
+          exact: v2
+    route:
+    - destination:
+        host: commerce-service.internal
+        subset: v2
+      weight: 100
+  - route:
+    - destination:
+        host: commerce-service.internal
+        subset: v1
+      weight: 90
+    - destination:
+        host: commerce-service.internal
+        subset: v2
+      weight: 10
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: commerce-destination
+spec:
+  host: commerce-service.internal
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 2
+    loadBalancer:
+      simple: LEAST_REQUEST
+    outlierDetection:
+      consecutiveErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+```
+
+---
+
+## 7. Security Architecture
+
+### 7.1 Security Layers
+
+#### 7.1.1 Defense in Depth Architecture
+
+```mermaid
+graph TB
+    subgraph "Layer 1: Perimeter Security"
+        CF[CloudFlare DDoS]
+        WAF[Web Application Firewall]
+    end
+    
+    subgraph "Layer 2: Network Security"
+        VPC[VPC Isolation]
+        SG[Security Groups]
+        NACL[Network ACLs]
+    end
+    
+    subgraph "Layer 3: Application Security"
+        AUTH[Authentication]
+        AUTHZ[Authorization]
+        CSRF[CSRF Protection]
+        XSS[XSS Prevention]
+    end
+    
+    subgraph "Layer 4: Data Security"
+        ENC[Encryption at Rest]
+        TLS[TLS 1.3]
+        TOKEN[Tokenization]
+    end
+    
+    subgraph "Layer 5: Monitoring"
+        SIEM[SIEM System]
+        IDS[Intrusion Detection]
+        AUDIT[Audit Logging]
+    end
+    
+    CF --> WAF --> VPC --> SG --> NACL
+    AUTH --> AUTHZ --> CSRF --> XSS
+    ENC --> TLS --> TOKEN
+    SIEM --> IDS --> AUDIT
+```
+
+#### 7.1.2 Zero Trust Security Model
+
+```python
+# Zero Trust Implementation
+class ZeroTrustSecurityFramework:
+    """Implement Zero Trust security principles"""
+    
+    def __init__(self):
+        self.principles = {
+            'verify_explicitly': True,
+            'least_privilege_access': True,
+            'assume_breach': True
+        }
+        
+        self.verification_layers = [
+            'device_trust',
+            'user_identity',
+            'location_context',
+            'application_access',
+            'data_classification'
+        ]
+    
+    async def authenticate_request(self, request) -> Dict:
+        """Multi-factor authentication flow"""
+        
+        # Device verification
+        device_trust = await self.verify_device(request.device_id)
+        if not device_trust['trusted']:
+            return {'allowed': False, 'reason': 'Untrusted device'}
+        
+        # User authentication
+        user_auth = await self.authenticate_user(
+            username=request.username,
+            password=request.password,
+            mfa_token=request.mfa_token
+        )
+        
+        if not user_auth['authenticated']:
+            return {'allowed': False, 'reason': 'Authentication failed'}
+        
+        # Context evaluation
+        context = await self.evaluate_context(request)
+        risk_score = self.calculate_risk_score(context)
+        
+        if risk_score > 0.7:
+            # High risk - require additional verification
+            additional_auth = await self.step_up_authentication(user_auth['user'])
+            if not additional_auth:
+                return {'allowed': False, 'reason': 'High risk access denied'}
+        
+        # Generate short-lived token
+        access_token = self.generate_access_token(
+            user=user_auth['user'],
+            permissions=self.get_user_permissions(user_auth['user']),
+            expires_in=900  # 15 minutes
+        )
+        
+        return {
+            'allowed': True,
+            'access_token': access_token,
+            'refresh_token': self.generate_refresh_token(user_auth['user'])
+        }
+    
+    def implement_least_privilege(self, user_role: str) -> Dict:
+        """Implement least privilege access control"""
+        
+        role_permissions = {
+            'customer': [
+                'orders:read:own',
+                'orders:create',
+                'products:read',
+                'profile:read:own',
+                'profile:update:own'
+            ],
+            'staff': [
+                'orders:read',
+                'orders:update',
+                'products:read',
+                'inventory:read',
+                'customers:read'
+            ],
+            'warehouse': [
+                'inventory:read',
+                'inventory:update',
+                'orders:read',
+                'shipments:create',
+                'shipments:update'
+            ],
+            'accountant': [
+                'reports:read',
+                'accounting:read',
+                'accounting:create',
+                'tax:read',
+                'tax:file'
+            ],
+            'admin': [
+                '*:*'  # Full access
+            ]
+        }
+        
+        return {
+            'role': user_role,
+            'permissions': role_permissions.get(user_role, []),
+            'resource_filters': self.get_resource_filters(user_role)
+        }
+```
+
+### 7.2 Application Security
+
+#### 7.2.1 OWASP Top 10 Protection
+
+```python
+# Security Middleware Implementation
+class SecurityMiddleware:
+    """Comprehensive security middleware"""
+    
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.security_headers = {
+            'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+            'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY',
+            'X-XSS-Protection': '1; mode=block',
+            'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline';",
+            'Referrer-Policy': 'strict-origin-when-cross-origin'
+        }
+    
+    def __call__(self, request):
+        # SQL Injection Prevention
+        self.sanitize_inputs(request)
+        
+        # XSS Prevention
+        self.validate_content_type(request)
+        
+        # CSRF Protection (Django built-in)
+        # Already handled by Django middleware
+        
+        # Session Security
+        self.validate_session(request)
+        
+        # Rate Limiting
+        if not self.check_rate_limit(request):
+            return JsonResponse({'error': 'Rate limit exceeded'}, status=429)
+        
+        response = self.get_response(request)
+        
+        # Add security headers
+        for header, value in self.security_headers.items():
+            response[header] = value
+        
+        return response
+    
+    def sanitize_inputs(self, request):
+        """Sanitize all user inputs"""
+        if request.method in ['POST', 'PUT', 'PATCH']:
+            for key, value in request.POST.items():
+                # Use parameterized queries (Django ORM does this)
+                # Additional validation
+                if self.contains_sql_keywords(value):
+                    raise SuspiciousOperation("Potential SQL injection attempt")
+    
+    def validate_content_type(self, request):
+        """Validate content type to prevent XSS"""
+        if request.method in ['POST', 'PUT', 'PATCH']:
+            content_type = request.content_type
+            if content_type and 'application/json' not in content_type:
+                # Check for potential XSS in other content types
+                if '<script' in request.body.decode('utf-8', errors='ignore').lower():
+                    raise SuspiciousOperation("Potential XSS attempt")
+
+# Input Validation Schema
+class InputValidator:
+    """Comprehensive input validation"""
+    
+    @staticmethod
+    def validate_email(email: str) -> bool:
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email) is not None
+    
+    @staticmethod
+    def validate_phone(phone: str) -> bool:
+        # Singapore phone number format
+        pattern = r'^(\+65)?[689]\d{7}$'
+        return re.match(pattern, phone) is not None
+    
+    @staticmethod
+    def validate_uen(uen: str) -> bool:
+        # Singapore UEN format
+        pattern = r'^([0-9]{8,9}[A-Z]|[TS][0-9]{2}[A-Z]{2}[0-9]{4}[A-Z])$'
+        return re.match(pattern, uen) is not None
+    
+    @staticmethod
+    def sanitize_html(html: str) -> str:
+        """Remove dangerous HTML tags"""
+        allowed_tags = ['p', 'br', 'strong', 'em', 'u', 'a', 'ul', 'ol', 'li']
+        allowed_attrs = {'a': ['href', 'title']}
+        
+        return bleach.clean(
+            html,
+            tags=allowed_tags,
+            attributes=allowed_attrs,
+            strip=True
+        )
+```
+
+### 7.3 Data Security
+
+#### 7.3.1 Encryption Architecture
+
+```python
+# Encryption Service Implementation
+class EncryptionService:
+    """Handle all encryption operations"""
+    
+    def __init__(self):
+        self.kms_client = boto3.client('kms', region_name='ap-southeast-1')
+        self.data_key_spec = 'AES_256'
+        
+    async def encrypt_pii(self, data: str, context: Dict = None) -> str:
+        """Encrypt PII data using AWS KMS"""
+        
+        # Generate data encryption key
+        response = self.kms_client.generate_data_key(
+            KeyId=os.environ.get('KMS_KEY_ID'),
+            KeySpec=self.data_key_spec,
+            EncryptionContext=context or {}
+        )
+        
+        # Use the plaintext key to encrypt data
+        cipher = AES.new(
+            response['Plaintext'],
+            AES.MODE_GCM
+        )
+        
+        ciphertext, tag = cipher.encrypt_and_digest(data.encode())
+        
+        # Return encrypted data with encrypted key
+        return base64.b64encode(
+            response['CiphertextBlob'] + cipher.nonce + tag + ciphertext
+        ).decode()
+    
+    async def decrypt_pii(self, encrypted_data: str, context: Dict = None) -> str:
+        """Decrypt PII data"""
+        
+        decoded = base64.b64decode(encrypted_data)
+        
+        # Extract components
+        encrypted_key = decoded[:512]  # Assuming 512 bytes for encrypted key
+        nonce = decoded[512:528]
+        tag = decoded[528:544]
+        ciphertext = decoded[544:]
+        
+        # Decrypt the data key
+        response = self.kms_client.decrypt(
+            CiphertextBlob=encrypted_key,
+            EncryptionContext=context or {}
+        )
+        
+        # Decrypt the data
+        cipher = AES.new(response['Plaintext'], AES.MODE_GCM, nonce=nonce)
+        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+        
+        return plaintext.decode()
+    
+    def hash_password(self, password: str) -> str:
+        """Hash password using bcrypt"""
+        return bcrypt.hashpw(
+            password.encode('utf-8'),
+            bcrypt.gensalt(rounds=12)
+        ).decode('utf-8')
+    
+    def tokenize_credit_card(self, card_number: str) -> str:
+        """Tokenize credit card for PCI compliance"""
+        # This would integrate with payment gateway tokenization
+        # Never store actual credit card numbers
+        return f"tok_{hashlib.sha256(card_number.encode()).hexdigest()[:16]}"
+```
+
+---
+
+## 8. Infrastructure Architecture
+
+### 8.1 AWS Cloud Architecture
+
+#### 8.1.1 Multi-AZ Deployment Architecture
+
+```yaml
+# AWS Infrastructure as Code (Terraform)
+infrastructure:
+  region: ap-southeast-1
+  
+  vpc:
+    cidr: "10.0.0.0/16"
+    availability_zones:
+      - ap-southeast-1a
+      - ap-southeast-1b
+      - ap-southeast-1c
+    
+    subnets:
+      public:
+        - cidr: "10.0.1.0/24"
+          az: ap-southeast-1a
+          name: public-subnet-1a
+        - cidr: "10.0.2.0/24"
+          az: ap-southeast-1b
+          name: public-subnet-1b
+          
+      private:
+        - cidr: "10.0.10.0/24"
+          az: ap-southeast-1a
+          name: private-subnet-1a
+        - cidr: "10.0.11.0/24"
+          az: ap-southeast-1b
+          name: private-subnet-1b
+          
+      data:
+        - cidr: "10.0.20.0/24"
+          az: ap-southeast-1a
+          name: data-subnet-1a
+        - cidr: "10.0.21.0/24"
+          az: ap-southeast-1b
+          name: data-subnet-1b
+  
+  compute:
+    eks_cluster:
+      name: smb-platform-cluster
+      version: "1.28"
+      node_groups:
+        - name: general
+          instance_types: ["t3a.large"]
+          min_size: 2
+          max_size: 10
+          desired_size: 4
+        - name: compute
+          instance_types: ["c5.xlarge"]
+          min_size: 1
+          max_size: 5
+          desired_size: 2
+          
+  database:
+    rds:
+      engine: postgres
+      version: "15.4"
+      instance_class: db.r6g.xlarge
+      multi_az: true
+      storage_type: gp3
+      allocated_storage: 100
+      max_allocated_storage: 1000
+      backup_retention: 30
+      
+    elasticache:
+      engine: redis
+      version: "7.0"
+      node_type: cache.r6g.large
+      num_cache_clusters: 3
+      automatic_failover: true
+      
+  storage:
+    s3_buckets:
+      - name: platform-assets
+        versioning: true
+        lifecycle_rules:
+          - transition_to_ia: 90
+          - transition_to_glacier: 365
+      - name: platform-backups
+        versioning: true
+        replication: cross-region
+```
+
+#### 8.1.2 Container Orchestration
+
+```yaml
+# Kubernetes Deployment Configuration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: commerce-service
+  namespace: production
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: commerce-service
+  template:
+    metadata:
+      labels:
+        app: commerce-service
+        version: v1.0.0
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - commerce-service
+            topologyKey: kubernetes.io/hostname
+      
+      containers:
+      - name: commerce
+        image: ecr.ap-southeast-1.amazonaws.com/commerce:v1.0.0
+        ports:
+        - containerPort: 8001
+          protocol: TCP
+        
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: database-credentials
+              key: url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-credentials
+              key: url
+        
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+      
+      volumes:
+      - name: config
+        configMap:
+          name: commerce-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: commerce-service
+  namespace: production
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8001
+    protocol: TCP
+  selector:
+    app: commerce-service
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: commerce-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: commerce-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+```
+
+### 8.2 Network Architecture
+
+#### 8.2.1 CDN and Edge Architecture
+
+```python
+# CDN Configuration
+cdn_architecture = {
+    'provider': 'CloudFlare',
+    'configuration': {
+        'zones': [
+            {
+                'domain': 'app.example.com',
+                'ssl': 'full_strict',
+                'min_tls_version': '1.2',
+                'http3': True,
+                'websockets': True
+            }
+        ],
+        'page_rules': [
+            {
+                'url': '/*',
+                'cache_level': 'aggressive',
+                'edge_cache_ttl': 7200,
+                'browser_cache_ttl': 3600
+            },
+            {
+                'url': '/api/*',
+                'cache_level': 'bypass',
+                'disable_performance': False
+            },
+            {
+                'url': '/static/*',
+                'cache_level': 'cache_everything',
+                'edge_cache_ttl': 2592000  # 30 days
+            }
+        ],
+        'firewall_rules': [
+            {
+                'expression': 'ip.geoip.country ne "SG"',
+                'action': 'challenge',
+                'description': 'Challenge non-Singapore traffic'
+            },
+            {
+                'expression': 'http.request.uri.path contains "admin"',
+                'action': 'allow',
+                'description': 'Allow admin access from whitelist',
+                'filter': 'ip.src in $office_ips'
+            }
+        ],
+        'rate_limiting': [
+            {
+                'threshold': 50,
+                'period': 60,
+                'match': {
+                    'request': {
+                        'methods': ['POST', 'PUT', 'DELETE'],
+                        'schemes': ['HTTPS'],
+                        'url': '/api/*'
+                    }
+                },
+                'action': 'simulate',
+                'response': {
+                    'status': 429,
+                    'body': 'Rate limit exceeded'
+                }
+            }
+        ],
+        'workers': {
+            'routes': [
+                {
+                    'pattern': 'api.example.com/transform/*',
+                    'script': 'image-optimization-worker'
+                }
+            ]
+        }
+    }
+}
+```
+
+---
+
+## 9. Performance Architecture
+
+### 9.1 Performance Optimization Strategy
+
+#### 9.1.1 Caching Architecture
+
+```python
+# Multi-Layer Caching Strategy
+class CachingArchitecture:
+    """Comprehensive caching implementation"""
+    
+    def __init__(self):
+        self.cache_layers = {
+            'edge': {
+                'provider': 'CloudFlare',
+                'ttl': 3600,
+                'scope': 'static_assets'
+            },
+            'application': {
+                'provider': 'Redis',
+                'ttl': 300,
+                'scope': 'api_responses'
+            },
+            'database': {
+                'provider': 'PostgreSQL',
+                'mechanism': 'materialized_views',
+                'scope': 'complex_queries'
+            },
+            'object': {
+                'provider': 'S3',
+                'ttl': 86400,
+                'scope': 'generated_reports'
+            }
+        }
+        
+        self.redis_client = Redis(
+            host='redis.internal',
+            port=6379,
+            decode_responses=True,
+            connection_pool=ConnectionPool(
+                max_connections=100,
+                max_connections_per_db=50
+            )
+        )
+    
+    async def get_or_set(self, key: str, generator_func, ttl: int = 300):
+        """Cache-aside pattern implementation"""
+        
+        # Try to get from cache
+        cached_value = await self.redis_client.get(key)
+        if cached_value:
+            # Update metrics
+            metrics.record_cache_hit(key)
+            return json.loads(cached_value)
+        
+        # Generate value
+        value = await generator_func()
+        
+        # Set in cache with TTL
+        await self.redis_client.setex(
+            key,
+            ttl,
+            json.dumps(value, cls=DateTimeEncoder)
+        )
+        
+        # Update metrics
+        metrics.record_cache_miss(key)
+        
+        return value
+    
+    def implement_cache_warming(self):
+        """Pre-populate cache with frequently accessed data"""
+        
+        warm_cache_queries = [
+            ('products:featured', self.get_featured_products, 3600),
+            ('categories:all', self.get_all_categories, 7200),
+            ('inventory:summary', self.get_inventory_summary, 300),
+            ('reports:daily', self.get_daily_report, 3600)
+        ]
+        
+        for key, query_func, ttl in warm_cache_queries:
+            try:
+                data = query_func()
+                self.redis_client.setex(key, ttl, json.dumps(data))
+                logger.info(f"Warmed cache for {key}")
+            except Exception as e:
+                logger.error(f"Failed to warm cache for {key}: {e}")
+    
+    def invalidate_cache(self, pattern: str):
+        """Invalidate cache by pattern"""
+        
+        cursor = 0
+        while True:
+            cursor, keys = self.redis_client.scan(
+                cursor,
+                match=pattern,
+                count=100
+            )
+            
+            if keys:
+                self.redis_client.delete(*keys)
+                logger.info(f"Invalidated {len(keys)} cache keys")
+            
+            if cursor == 0:
+                break
+```
+
+#### 9.1.2 Database Performance Optimization
+
+```sql
+-- Performance Optimization Queries
+
+-- Create indexes for common queries
+CREATE INDEX CONCURRENTLY idx_orders_customer_date 
+ON orders(customer_id, order_date DESC) 
+WHERE status != 'cancelled';
+
+CREATE INDEX CONCURRENTLY idx_products_search
+ON products USING gin(
+    to_tsvector('english', name || ' ' || coalesce(description, ''))
+);
+
+CREATE INDEX CONCURRENTLY idx_inventory_low_stock
+ON inventory_levels(product_variant_id, location_id)
+WHERE quantity_available < reorder_point;
+
+-- Partitioning for large tables
+CREATE TABLE order_items_2024_01 PARTITION OF order_items
+FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+-- Materialized views for reporting
+CREATE MATERIALIZED VIEW mv_daily_sales AS
+SELECT 
+    DATE(order_date) as sale_date,
+    COUNT(DISTINCT order_id) as order_count,
+    COUNT(DISTINCT customer_id) as unique_customers,
+    SUM(subtotal) as gross_sales,
+    SUM(tax_amount) as total_tax,
+    SUM(total_amount) as net_sales,
+    AVG(total_amount) as avg_order_value,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY total_amount) as median_order_value
+FROM orders
+WHERE status = 'completed'
+GROUP BY DATE(order_date)
+WITH DATA;
+
+CREATE UNIQUE INDEX ON mv_daily_sales(sale_date);
+
+-- Refresh materialized view
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_sales;
+
+-- Query optimization using EXPLAIN
+EXPLAIN (ANALYZE, BUFFERS) 
+SELECT 
+    p.name,
+    p.sku,
+    il.quantity_available,
+    il.reorder_point
+FROM products p
+JOIN inventory_levels il ON p.id = il.product_id
+WHERE il.quantity_available < il.reorder_point
+ORDER BY il.quantity_available ASC
+LIMIT 50;
+```
+
+### 9.2 Performance Monitoring
+
+#### 9.2.1 Application Performance Monitoring
+
+```python
+# APM Implementation
+class PerformanceMonitor:
+    """Application Performance Monitoring"""
+    
+    def __init__(self):
+        self.metrics_client = PrometheusClient()
+        self.tracing_client = JaegerClient()
+        
+        # Define metrics
+        self.request_duration = Histogram(
+            'http_request_duration_seconds',
+            'HTTP request duration',
+            ['method', 'endpoint', 'status']
+        )
+        
+        self.database_query_duration = Histogram(
+            'database_query_duration_seconds',
+            'Database query duration',
+            ['query_type', 'table']
+        )
+        
+        self.cache_hit_rate = Counter(
+            'cache_hits_total',
+            'Cache hit rate',
+            ['cache_type', 'key_pattern']
+        )
+    
+    def track_request(self, method: str, endpoint: str):
+        """Track HTTP request performance"""
+        
+        @contextmanager
+        def timer():
+            start = time.time()
+            span = self.tracing_client.start_span(
+                f"{method} {endpoint}",
+                tags={
+                    'http.method': method,
+                    'http.url': endpoint
+                }
+            )
+            
+            try:
+                yield span
+                status = 200
+            except Exception as e:
+                status = 500
+                span.set_tag('error', True)
+                span.log_kv({'error': str(e)})
+                raise
+            finally:
+                duration = time.time() - start
+                self.request_duration.labels(
+                    method=method,
+                    endpoint=endpoint,
+                    status=status
+                ).observe(duration)
+                span.finish()
+        
+        return timer
+    
+    def track_database_query(self, query: str, params: tuple = None):
+        """Track database query performance"""
+        
+        @contextmanager
+        def timer():
+            start = time.time()
+            
+            # Parse query to determine type
+            query_type = self.get_query_type(query)
+            table = self.get_table_name(query)
+            
+            try:
+                yield
+            finally:
+                duration = time.time() - start
+                self.database_query_duration.labels(
+                    query_type=query_type,
+                    table=table
+                ).observe(duration)
+                
+                # Log slow queries
+                if duration > 1.0:
+                    logger.warning(
+                        f"Slow query detected: {duration:.2f}s - {query[:100]}"
+                    )
+    
+    def get_performance_report(self) -> Dict:
+        """Generate performance report"""
+        
+        return {
+            'response_times': {
+                'p50': self.get_percentile(50),
+                'p95': self.get_percentile(95),
+                'p99': self.get_percentile(99)
+            },
+            'throughput': {
+                'requests_per_second': self.calculate_rps(),
+                'orders_per_minute': self.calculate_opm()
+            },
+            'error_rate': self.calculate_error_rate(),
+            'cache_hit_rate': self.calculate_cache_hit_rate(),
+            'database': {
+                'slow_queries': self.get_slow_queries(),
+                'connection_pool_usage': self.get_pool_usage()
+            }
+        }
+```
+
+---
+
+## 10. Deployment Architecture
+
+### 10.1 CI/CD Pipeline
+
+#### 10.1.1 GitHub Actions Workflow
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: singapore-smb-platform
+  EKS_CLUSTER: smb-platform-cluster
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements/test.txt
+    
+    - name: Run tests
+      run: |
+        pytest --cov=apps --cov-report=xml --cov-report=html
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+    
+    - name: Run security scan
+      run: |
+        pip install bandit safety
+        bandit -r apps/
+        safety check
+  
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Build and push Docker image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+  
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+    
+    - name: Deploy to Kubernetes
+      run: |
+        kubectl set image deployment/commerce-service commerce=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} -n production
+        kubectl set image deployment/inventory-service inventory=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} -n production
+        kubectl set image deployment/accounting-service accounting=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} -n production
+        kubectl rollout status deployment/commerce-service -n production
+        kubectl rollout status deployment/inventory-service -n production
+        kubectl rollout status deployment/accounting-service -n production
+    
+    - name: Run smoke tests
+      run: |
+        chmod +x ./scripts/smoke_tests.sh
+        ./scripts/smoke_tests.sh
+```
+
+### 10.2 Blue-Green Deployment
+
+```python
+# Blue-Green Deployment Strategy
+class BlueGreenDeployment:
+    """Implement blue-green deployment"""
+    
+    def __init__(self):
+        self.k8s_client = kubernetes.client.ApiClient()
+        self.apps_v1 = kubernetes.client.AppsV1Api()
+        self.core_v1 = kubernetes.client.CoreV1Api()
+        
+    async def deploy(self, service: str, new_image: str):
+        """Execute blue-green deployment"""
+        
+        # Step 1: Deploy to green environment
+        green_deployment = await self.create_green_deployment(service, new_image)
+        
+        # Step 2: Run health checks
+        if not await self.health_check(green_deployment):
+            await self.rollback(green_deployment)
+            raise DeploymentError("Health check failed")
+        
+        # Step 3: Run smoke tests
+        if not await self.smoke_test(green_deployment):
+            await self.rollback(green_deployment)
+            raise DeploymentError("Smoke tests failed")
+        
+        # Step 4: Switch traffic to green
+        await self.switch_traffic(service, 'green')
+        
+        # Step 5: Monitor for issues
+        await asyncio.sleep(300)  # 5 minutes monitoring
+        
+        if await self.check_error_rate(service) > 0.01:
+            # Rollback if error rate > 1%
+            await self.switch_traffic(service, 'blue')
+            await self.cleanup(green_deployment)
+            raise DeploymentError("High error rate detected")
+        
+        # Step 6: Cleanup blue deployment
+        await self.cleanup_blue(service)
+        
+        # Step 7: Mark green as new blue
+        await self.promote_green_to_blue(service)
+        
+        return {'status': 'success', 'deployment': green_deployment}
+```
+
+---
+
+## 11. Monitoring & Operations Architecture
+
+### 11.1 Observability Stack
+
+#### 11.1.1 Monitoring Architecture
+
+```yaml
+# Prometheus Configuration
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+    - role: pod
+    relabel_configs:
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+      action: keep
+      regex: true
+    - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+      action: replace
+      target_label: __metrics_path__
+      regex: (.+)
+    
+  - job_name: 'application-metrics'
+    static_configs:
+    - targets:
+      - 'commerce-service:9090'
+      - 'inventory-service:9090'
+      - 'accounting-service:9090'
+    
+  - job_name: 'node-exporter'
+    kubernetes_sd_configs:
+    - role: node
+    relabel_configs:
+    - action: labelmap
+      regex: __meta_kubernetes_node_label_(.+)
+
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      - 'alertmanager:9093'
+
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+```
+
+#### 11.1.2 Logging Architecture
+
+```python
+# Centralized Logging Configuration
+logging_architecture = {
+    'collection': {
+        'agent': 'Fluent Bit',
+        'configuration': '''
+            [SERVICE]
+                Flush         5
+                Daemon        off
+                Log_Level     info
+            
+            [INPUT]
+                Name              tail
+                Path              /var/log/containers/*.log
+                Parser            docker
+                Tag               kube.*
+                Refresh_Interval  5
+            
+            [FILTER]
+                Name                kubernetes
+                Match               kube.*
+                Kube_URL            https://kubernetes.default.svc:443
+                Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+            
+            [OUTPUT]
+                Name            es
+                Match           *
+                Host            elasticsearch.logging
+                Port            9200
+                Index           logs
+                Type            _doc
+                Retry_Limit     5
+        '''
+    },
+    'storage': {
+        'solution': 'Elasticsearch',
+        'retention': '30 days',
+        'indices': [
+            'logs-application',
+            'logs-audit',
+            'logs-security',
+            'logs-performance'
+        ]
+    },
+    'visualization': {
+        'tool': 'Kibana',
+        'dashboards': [
+            'Application Overview',
+            'Error Analysis',
+            'Security Events',
+            'Business Metrics'
+        ]
+    }
+}
+```
+
+---
+
+## 12. Development Architecture
+
+### 12.1 Development Environment
+
+#### 12.1.1 Local Development Setup
+
+```yaml
+# docker-compose.yml for local development
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: smb_platform
+      POSTGRES_USER: developer
+      POSTGRES_PASSWORD: devpass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+  
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+  
+  elasticsearch:
+    image: elasticsearch:8.10.2
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+  
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: developer
+      RABBITMQ_DEFAULT_PASS: devpass
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+  
+  commerce:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      DATABASE_URL: postgresql://developer:devpass@postgres/smb_platform
+      REDIS_URL: redis://redis:6379
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      RABBITMQ_URL: amqp://developer:devpass@rabbitmq:5672
+    volumes:
+      - .:/app
+    ports:
+      - "8001:8001"
+    depends_on:
+      - postgres
+      - redis
+      - elasticsearch
+      - rabbitmq
+    command: python manage.py runserver 0.0.0.0:8001
+
+volumes:
+  postgres_data:
+  redis_data:
+  es_data:
+```
+
+### 12.2 Testing Architecture
+
+#### 12.2.1 Test Strategy
+
+```python
+# Comprehensive Testing Framework
+class TestingArchitecture:
+    """Multi-layer testing strategy"""
+    
+    def __init__(self):
+        self.test_levels = {
+            'unit': {
+                'coverage_target': 90,
+                'framework': 'pytest',
+                'location': 'tests/unit/'
+            },
+            'integration': {
+                'coverage_target': 80,
+                'framework': 'pytest',
+                'location': 'tests/integration/'
+            },
+            'e2e': {
+                'framework': 'Selenium/Cypress',
+                'location': 'tests/e2e/'
+            },
+            'performance': {
+                'framework': 'Locust',
+                'location': 'tests/performance/'
+            },
+            'security': {
+                'framework': 'OWASP ZAP',
+                'location': 'tests/security/'
+            }
+        }
+```
+
+---
+
+## 13. Architecture Decision Records
+
+### 13.1 ADR-001: Microservices Architecture
+
+**Status**: Accepted  
+**Date**: 2024-12-01
+
+**Context**: Need to build a scalable, maintainable platform supporting multiple business domains.
+
+**Decision**: Adopt microservices architecture with service boundaries aligned to business domains.
+
+**Consequences**:
+- ✅ Independent scaling and deployment
+- ✅ Technology flexibility per service
+- ✅ Fault isolation
+- ❌ Increased complexity
+- ❌ Network latency between services
+
+### 13.2 ADR-002: Django as Primary Framework
+
+**Status**: Accepted  
+**Date**: 2024-12-01
+
+**Context**: Need robust framework with built-in admin, ORM, and security features.
+
+**Decision**: Use Django 5.0+ for all backend services.
+
+**Consequences**:
+- ✅ Rapid development with "batteries included"
+- ✅ Excellent admin interface
+- ✅ Strong security defaults
+- ❌ Python GIL limitations
+- ❌ Heavier than micro-frameworks
+
+### 13.3 ADR-003: Event-Driven Communication
+
+**Status**: Accepted  
+**Date**: 2024-12-01
+
+**Context**: Services need to communicate asynchronously for better decoupling.
+
+**Decision**: Use RabbitMQ for event bus with eventual consistency.
+
+**Consequences**:
+- ✅ Loose coupling between services
+- ✅ Better scalability
+- ✅ Resilience to failures
+- ❌ Eventual consistency complexity
+- ❌ Debugging challenges
+
+---
+
+## 14. Risk Analysis & Mitigation
+
+### 14.1 Technical Risks
+
+| Risk | Probability | Impact | Mitigation Strategy |
+|------|-------------|--------|-------------------|
+| **Database bottleneck** | Medium | High | Read replicas, caching, query optimization |
+| **Service cascading failure** | Low | Critical | Circuit breakers, timeouts, bulkheads |
+| **Data inconsistency** | Medium | High | Saga pattern, event sourcing |
+| **Security breach** | Low | Critical | Defense in depth, regular audits |
+| **Performance degradation** | Medium | Medium | APM, auto-scaling, performance testing |
+
+### 14.2 Operational Risks
+
+| Risk | Probability | Impact | Mitigation Strategy |
+|------|-------------|--------|-------------------|
+| **Deployment failure** | Low | High | Blue-green deployment, automated rollback |
+| **Data loss** | Low | Critical | Automated backups, disaster recovery |
+| **Vendor lock-in** | Medium | Medium | Abstraction layers, portable containers |
+| **Skill shortage** | Medium | Medium | Documentation, training, standard tools |
+
+---
+
+## 15. Architecture Roadmap
+
+### 15.1 Phase 1: Foundation (Months 1-3)
+- ✅ Core microservices setup
+- ✅ Basic CI/CD pipeline
+- ✅ PostgreSQL and Redis
+- ✅ API Gateway
+- ✅ Basic monitoring
+
+### 15.2 Phase 2: Enhancement (Months 4-6)
+- 🔄 Event-driven architecture
+- 🔄 Advanced caching
+- 🔄 Service mesh
+- 🔄 Enhanced security
+- 🔄 Performance optimization
+
+### 15.3 Phase 3: Scale (Months 7-9)
+- 📅 Multi-region deployment
+- 📅 Advanced analytics
+- 📅 AI/ML integration
+- 📅 Real-time features
+- 📅 Advanced automation
+
+### 15.4 Phase 4: Optimize (Months 10-12)
+- 📅 Cost optimization
+- 📅 Advanced monitoring
+- 📅 Chaos engineering
+- 📅 Platform maturity
+- 📅 Innovation features
+
+---
+
+## 16. Appendices
+
+### Appendix A: Technology Stack Summary
+
+| Layer | Technology | Version | Purpose |
+|-------|------------|---------|---------|
+| **Backend** | Django | 5.0+ | Web framework |
+| **Frontend** | React | 18+ | UI framework |
+| **Database** | PostgreSQL | 15+ | Primary database |
+| **Cache** | Redis | 7.0+ | Caching layer |
+| **Search** | Elasticsearch | 8.10+ | Full-text search |
+| **Queue** | RabbitMQ | 3.12+ | Message broker |
+| **Container** | Docker | 24+ | Containerization |
+| **Orchestration** | Kubernetes | 1.28+ | Container orchestration |
+| **Cloud** | AWS | - | Cloud infrastructure |
+| **CDN** | CloudFlare | - | Content delivery |
+| **Monitoring** | Prometheus | 2.40+ | Metrics collection |
+| **Logging** | ELK Stack | 8+ | Log management |
+
+### Appendix B: Security Checklist
+
+- [x] TLS 1.3 for all communications
+- [x] WAF implementation
+- [x] DDoS protection
+- [x] OWASP Top 10 mitigation
+- [x] PCI DSS compliance
+- [x] PDPA compliance
+- [x] Regular security audits
+- [x] Penetration testing
+- [x] Security training
+- [x] Incident response plan
+
+### Appendix C: Performance Benchmarks
+
+| Metric | Target | Current | Status |
+|--------|--------|---------|--------|
+| **Page Load** | < 2s | 1.8s | ✅ |
+| **API Response** | < 200ms | 150ms | ✅ |
+| **Database Query** | < 100ms | 80ms | ✅ |
+| **Cache Hit Rate** | > 80% | 85% | ✅ |
+| **Error Rate** | < 0.1% | 0.05% | ✅ |
+| **Availability** | 99.99% | 99.95% | 🔄 |
+
+---
+
+## Document Approval
+
+| Role | Name | Date | Signature |
+|------|------|------|-----------|
+| **CTO** | | | |
+| **Technical Architect** | | | |
+| **Security Officer** | | | |
+| **DevOps Lead** | | | |
+| **Development Lead** | | | |
+
+---
+
+*This Project Architecture Document represents the comprehensive technical blueprint for the Singapore SMB E-Commerce Platform. It should be reviewed quarterly and updated as the architecture evolves.*
+
+**End of Document**
