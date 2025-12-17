@@ -3440,5 +3440,4332 @@ CREATE TABLE accounts (
     currency VARCHAR(3) NOT NULL DEFAULT 'SGD',
     current_balance DECIMAL(15,2) NOT NULL DEFAULT 0,
     
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    is_system_account BOOLEAN
+is_active BOOLEAN NOT NULL DEFAULT TRUE,
+is_system_account BOOLEAN NOT NULL DEFAULT FALSE,
+
+-- Audit
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+created_by UUID REFERENCES users(id),
+
+CONSTRAINT accounts_company_code_unique UNIQUE (company_id, account_code)
+);
+
+CREATE INDEX idx_accounts_company_type ON accounts(company_id, account_type);
+CREATE INDEX idx_accounts_gst_mapping ON accounts(gst_mapping) WHERE gst_mapping IS NOT NULL;
+CREATE INDEX idx_accounts_iras_code ON accounts(iras_reporting_code) WHERE iras_reporting_code IS NOT NULL;
+
+-- Journal Entries (double-entry accounting)
+CREATE TABLE journal_entries (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+entry_number VARCHAR(50) NOT NULL,
+entry_date DATE NOT NULL,
+description TEXT NOT NULL,
+
+reference_type VARCHAR(50), -- order, purchase_order, transfer_order
+reference_id UUID,
+
+status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'posted', 'reversed', 'voided')),
+is_reversing_entry BOOLEAN NOT NULL DEFAULT FALSE,
+reverses_entry_id UUID REFERENCES journal_entries(id),
+
+-- GST compliance
+gst_period VARCHAR(7), -- YYYY-MM (e.g., 2024-12)
+gst_f5_box VARCHAR(10), -- Box 1, Box 2, etc.
+
+-- Audit
+created_by UUID NOT NULL REFERENCES users(id),
+approved_by UUID REFERENCES users(id),
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+posted_at TIMESTAMP WITH TIME ZONE,
+approved_at TIMESTAMP WITH TIME ZONE,
+
+UNIQUE(company_id, entry_number)
+);
+
+CREATE INDEX idx_journal_entries_company_date ON journal_entries(company_id, entry_date DESC);
+CREATE INDEX idx_journal_entries_gst_period ON journal_entries(gst_period) WHERE gst_period IS NOT NULL;
+CREATE INDEX idx_journal_entries_reference ON journal_entries(reference_type, reference_id);
+CREATE INDEX idx_journal_entries_status ON journal_entries(status);
+
+-- Journal Lines (journal entry line items)
+CREATE TABLE journal_lines (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+journal_entry_id UUID NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
+account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+
+line_number INTEGER NOT NULL,
+
+-- Amounts
+debit_amount DECIMAL(15,2) NOT NULL DEFAULT 0 CHECK (debit_amount >= 0),
+credit_amount DECIMAL(15,2) NOT NULL DEFAULT 0 CHECK (credit_amount >= 0),
+
+-- Must have either debit OR credit, not both
+CONSTRAINT check_amounts CHECK (
+(debit_amount > 0 AND credit_amount = 0) OR
+(credit_amount > 0 AND debit_amount = 0)
+),
+
+description TEXT,
+
+-- GST details
+gst_amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+gst_type VARCHAR(20), -- standard_rated, zero_rated, exempt, out_of_scope
+
+-- Foreign currency
+is_foreign_currency BOOLEAN NOT NULL DEFAULT FALSE,
+foreign_currency_code VARCHAR(3),
+foreign_currency_amount DECIMAL(15,2),
+exchange_rate DECIMAL(10,6),
+
+INDEX idx_journal_lines_journal ON journal_lines(journal_entry_id),
+INDEX idx_journal_lines_account ON journal_lines(account_id),
+INDEX idx_journal_lines_gst_type ON journal_lines(gst_type) WHERE gst_type IS NOT NULL
+);
+
+-- GST Returns (F5, F7, F8)
+CREATE TABLE gst_returns (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+return_type VARCHAR(10) NOT NULL CHECK (return_type IN ('F5', 'F7', 'F8')), -- F5: regular, F7: bad debts, F8: final
+quarter INTEGER NOT NULL CHECK (quarter BETWEEN 1 AND 4),
+year INTEGER NOT NULL,
+gst_period VARCHAR(7) NOT NULL, -- YYYY-MM
+
+-- F5 Boxes
+box_1 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Standard-rated supplies
+box_2 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Zero-rated supplies
+box_3 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Exempt supplies
+box_4 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Total supplies (1+2+3)
+box_5 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Taxable purchases
+box_6 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Output tax
+box_7 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Input tax
+box_8 DECIMAL(15,2) NOT NULL DEFAULT 0, -- Net GST (6-7)
+
+-- Status
+status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'validated', 'submitted', 'filed')),
+submission_date DATE,
+transaction_id VARCHAR(100), -- IRAS transaction ID
+receipt_number VARCHAR(100), -- IRAS receipt number
+
+-- Audit
+prepared_by UUID REFERENCES users(id),
+approved_by UUID REFERENCES users(id),
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+submitted_at TIMESTAMP WITH TIME ZONE,
+approved_at TIMESTAMP WITH TIME ZONE,
+
+UNIQUE(company_id, quarter, year, return_type)
+);
+
+CREATE INDEX idx_gst_returns_company_period ON gst_returns(company_id, gst_period);
+CREATE INDEX idx_gst_returns_status ON gst_returns(status);
+
+-- PDPA Consent Management
+CREATE TABLE data_consents (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+
+purpose VARCHAR(50) NOT NULL CHECK (purpose IN (
+'order_processing', 'marketing', 'analytics', 'third_party_sharing', 'legal_compliance'
+)),
+method VARCHAR(20) NOT NULL CHECK (method IN ('explicit', 'implied', 'contract')),
+granted BOOLEAN NOT NULL DEFAULT TRUE,
+
+-- Consent details
+consent_text TEXT NOT NULL,
+consent_version VARCHAR(20) NOT NULL,
+language VARCHAR(10) NOT NULL DEFAULT 'en',
+
+-- Context
+ip_address INET,
+user_agent TEXT,
+session_id VARCHAR(100),
+
+timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+withdrawn_at TIMESTAMP WITH TIME ZONE,
+
+INDEX idx_consents_company_customer ON data_consents(company_id, customer_id),
+INDEX idx_consents_purpose ON data_consents(purpose),
+INDEX idx_consents_withdrawn ON data_consents(withdrawn_at) WHERE withdrawn_at IS NOT NULL
+);
+
+-- Data access requests (PDPA compliance)
+CREATE TABLE data_access_requests (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+
+request_type VARCHAR(20) NOT NULL CHECK (request_type IN ('access', 'correction', 'deletion')),
+status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'rejected')),
+
+requested_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+due_date DATE NOT NULL, -- 30 days from requested_at
+completed_at TIMESTAMP WITH TIME ZONE,
+
+report_url VARCHAR(500), -- Secure URL to data report
+rejection_reason TEXT,
+
+INDEX idx_dar_company_customer ON data_access_requests(company_id, customer_id),
+INDEX idx_dar_status ON data_access_requests(status),
+INDEX idx_dar_due_date ON data_access_requests(due_date)
+);
+
+-- Audit log (comprehensive)
+CREATE TABLE audit_logs (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+event_type VARCHAR(50) NOT NULL, -- login, logout, create, update, delete, export
+event_category VARCHAR(50) NOT NULL, -- security, data, financial, system
+
+user_id UUID REFERENCES users(id),
+ip_address INET,
+user_agent TEXT,
+
+resource_type VARCHAR(50), -- Product, Order, etc.
+resource_id UUID, -- Can be any UUID
+action VARCHAR(20), -- CREATE, READ, UPDATE, DELETE
+changes JSONB, -- {field: {old: val, new: val}}
+
+timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+INDEX idx_audit_logs_company_user ON audit_logs(company_id, user_id, timestamp DESC),
+INDEX idx_audit_logs_event_type ON audit_logs(event_type, timestamp DESC),
+INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id)
+) PARTITION BY RANGE (timestamp);
+
+-- Create monthly partitions for audit_logs
+CREATE TABLE audit_logs_2024_12 PARTITION OF audit_logs
+FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
+
+-- System settings and configuration
+CREATE TABLE system_settings (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+setting_key VARCHAR(100) NOT NULL,
+setting_value JSONB NOT NULL,
+data_type VARCHAR(20) NOT NULL CHECK (data_type IN ('string', 'number', 'boolean', 'json')),
+is_system_setting BOOLEAN NOT NULL DEFAULT FALSE,
+description TEXT,
+
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+UNIQUE(company_id, setting_key)
+);
+
+-- License management for industry-specific compliance
+CREATE TABLE business_licenses (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+license_type VARCHAR(50) NOT NULL, -- sfa_food_shop, hsa_product_registration, etc.
+license_number VARCHAR(100) NOT NULL,
+issuing_authority VARCHAR(100) NOT NULL,
+
+issue_date DATE NOT NULL,
+expiry_date DATE,
+renewal_required BOOLEAN NOT NULL DEFAULT TRUE,
+renewal_reminder_days INTEGER NOT NULL DEFAULT 90,
+
+-- Documents
+certificate_file VARCHAR(500),
+supporting_documents JSONB, -- Array of file URLs
+
+-- Status
+status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'expired', 'renewal_pending', 'suspended')),
+compliance_status VARCHAR(20), -- Pending verification
+
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+expiry_notified_at TIMESTAMP WITH TIME ZONE,
+
+INDEX idx_licenses_company_type ON business_licenses(company_id, license_type),
+INDEX idx_licenses_expiry ON business_licenses(expiry_date) WHERE expiry_date IS NOT NULL
+);
+
+-- Webhook subscriptions (for external integrations)
+CREATE TABLE webhook_subscriptions (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+
+endpoint_url VARCHAR(500) NOT NULL,
+secret_key VARCHAR(100) NOT NULL, -- For HMAC signatures
+
+events TEXT[] NOT NULL, -- ['order.created', 'order.paid']
+is_active BOOLEAN NOT NULL DEFAULT TRUE,
+retry_count INTEGER NOT NULL DEFAULT 3,
+timeout_seconds INTEGER NOT NULL DEFAULT 10,
+
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+INDEX idx_webhooks_company ON webhook_subscriptions(company_id),
+INDEX idx_webhooks_active ON webhook_subscriptions(is_active) WHERE is_active = TRUE
+);
+
+-- Webhook delivery logs
+CREATE TABLE webhook_deliveries (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+subscription_id UUID NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
+
+event_type VARCHAR(100) NOT NULL,
+payload JSONB NOT NULL,
+attempt_number INTEGER NOT NULL,
+
+http_status INTEGER,
+response_body TEXT,
+error_message TEXT,
+
+created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+INDEX idx_deliveries_subscription ON webhook_deliveries(subscription_id, created_at DESC)
+);
+
+-- Partition old webhook deliveries after 90 days
+```
+
+#### 6.3.2 Performance Optimization Strategy
+```python
+database_optimization_strategy = {
+    'connection_management': {
+        'pooling': {
+            'technology': 'pgBouncer 1.20',
+            'mode': 'Transaction pooling (best for ORM)',
+            'max_client_connections': 200,
+            'default_pool_size': 50,
+            'reserve_pool_size': 10,
+            'reserve_pool_timeout': 5,
+            'server_idle_timeout': 600
+        },
+        'django_settings': {
+            'CONN_MAX_AGE': 600,  # 10 minutes persistent connections
+            'CONN_HEALTH_CHECKS': True,
+            'AUTOCOMMIT': True
+        }
+    },
+    
+    'query_optimization': {
+        'select_related': 'Use for ForeignKey/OneToOne (single query join)',
+        'prefetch_related': 'Use for ManyToMany/reverse FK (separate queries)',
+        'only': 'Select only needed columns',
+        'defer': 'Defer large fields (description, specs)',
+        'values': 'Use for aggregations instead of model instances',
+        'exists': 'Use instead of count() for boolean checks',
+        'iterator': 'For large querysets to avoid memory bloat',
+        
+        'common_patterns': {
+            'product_list': 'products.prefetch_related("images", "category").only("id", "name", "sku", "base_price")',
+            'order_detail': 'orders.select_related("customer", "shipping_address").prefetch_related("items")',
+            'inventory_report': 'stock.select_related("product", "location").filter(quantity_available__lt=F("reorder_point"))'
+        }
+    },
+    
+    'index_optimization': {
+        'critical_queries': [
+            {
+                'query': 'orders_by_customer_date',
+                'sql': 'SELECT * FROM orders WHERE company_id = ? AND customer_id = ? ORDER BY created_at DESC',
+                'index': 'CREATE INDEX idx_orders_company_customer_date ON orders(company_id, customer_id, created_at DESC)'
+            },
+            {
+                'query': 'low_stock_alerts',
+                'sql': 'SELECT * FROM inventory_stock WHERE company_id = ? AND quantity_available < reorder_point',
+                'index': 'CREATE INDEX idx_stock_low_stock ON inventory_stock(company_id, reorder_point, quantity_available) WHERE quantity_available < reorder_point'
+            },
+            {
+                'query': 'gst_report_by_period',
+                'sql': 'SELECT * FROM journal_entries WHERE company_id = ? AND gst_period = ? ORDER BY entry_date',
+                'index': 'CREATE INDEX idx_journal_gst_period ON journal_entries(company_id, gst_period, entry_date)'
+            },
+            {
+                'query': 'product_search',
+                'sql': 'SELECT * FROM products WHERE company_id = ? AND is_active = TRUE AND (name ILIKE ? OR sku ILIKE ?)',
+                'index': 'CREATE INDEX idx_products_search ON products(company_id, is_active) WHERE is_active = TRUE; CREATE INDEX idx_products_name_trgm ON products USING GIN (name gin_trgm_ops)'
+            }
+        ]
+    },
+    
+    'partitioning_strategy': {
+        'orders': {
+            'method': 'RANGE partitioning by entry_date',
+            'interval': 'Monthly partitions',
+            'script': """
+                CREATE TABLE orders_y2024m12 PARTITION OF orders
+                FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
+                
+                CREATE TABLE orders_y2025m01 PARTITION OF orders
+                FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+            """,
+            'maintenance': 'Automated via pg_partman extension',
+            'retention': '36 months online, archive to S3 after'
+        },
+        'journal_entries': {
+            'method': 'RANGE partitioning by entry_date',
+            'interval': 'Quarterly partitions',
+            'retention': '84 months (7 years for IRAS compliance)'
+        },
+        'audit_logs': {
+            'method': 'RANGE partitioning by timestamp',
+            'interval': 'Monthly partitions',
+            'retention': '12 months hot, 90 days cold'
+        }
+    },
+    
+    'materialized_views_for_reporting': {
+        'sales_summary_daily': {
+            'definition': '''
+                CREATE MATERIALIZED VIEW sales_summary_daily AS
+                SELECT
+                    company_id,
+                    DATE(created_at) as sale_date,
+                    COUNT(*) as order_count,
+                    SUM(total_amount) as total_revenue,
+                    AVG(total_amount) as avg_order_value
+                FROM orders
+                WHERE status IN ('paid', 'shipped', 'delivered')
+                GROUP BY company_id, DATE(created_at)
+            ''',
+            'refresh': 'Daily at 2 AM via Celery beat',
+            'indexes': 'CREATE UNIQUE INDEX ON sales_summary_daily (company_id, sale_date)'
+        },
+        'inventory_turnover_monthly': {
+            'definition': '''
+                CREATE MATERIALIZED VIEW inventory_turnover_monthly AS
+                SELECT
+                    company_id,
+                    product_id,
+                    month,
+                    (SUM(quantity_sold) * 2.0) / NULLIF(SUM(quantity_on_hand) + LAG(SUM(quantity_on_hand)) OVER w, 0) as turnover_ratio
+                FROM inventory_stock
+                WINDOW w AS (PARTITION BY company_id, product_id ORDER BY month)
+                GROUP BY company_id, product_id, month
+            ''',
+            'refresh': 'Monthly on 1st at 3 AM'
+        }
+    },
+    
+    'query_caching_strategy': {
+        'redis_cache_patterns': [
+            {
+                'key_pattern': 'product:{company_id}:{sku}',
+                'value': 'Product details JSON',
+                'ttl': 3600,  # 1 hour
+                'invalidation': 'On product update'
+            },
+            {
+                'key_pattern': 'inventory:{company_id}:{product_id}:{location_id}',
+                'value': 'Stock quantity',
+                'ttl': 300,  # 5 minutes
+                'invalidation': 'On stock movement'
+            },
+            {
+                'key_pattern': 'order:{order_number}',
+                'value': 'Order details',
+                'ttl': 7200,  # 2 hours
+                'invalidation': 'On order status change'
+            },
+            {
+                'key_pattern': 'gst_calculation:{company_id}:{date}:{total}',
+                'value': 'GST breakdown',
+                'ttl': 86400,  # 24 hours
+                'invalidation': 'Never (deterministic calculation)'
+            }
+        ],
+        'django_cache_config': {
+            'default_backend': 'django_redis.cache.RedisCache',
+            'location': 'redis://redis-cache:6379/1',
+            'options': {'CLIENT_CLASS': 'django_redis.client.DefaultClient'}
+        },
+        'cacheops_decorators': '''
+        @cached(timeout=3600)
+        def get_product(sku): ...
+        
+        @cached_as(InventoryStock, timeout=300)
+        def get_stock_status(product_id): ...
+        '''
+    },
+    
+    'read_replica_strategy': {
+        'configuration': {
+            'primary': 'postgres://primary:5432/dbname',
+            'replicas': [
+                'postgres://replica1:5432/dbname',
+                'postgres://replica2:5432/dbname'
+            ]
+        },
+        'routing_rules': {
+            'write_operations': 'PRIMARY only (INSERT, UPDATE, DELETE, FOR UPDATE)',
+            'read_operations': 'REPLICAS (SELECT)',
+            'exceptions': {
+                'primary_required': [
+                    'User authentication queries',
+                    'Transaction-sensitive reports',
+                    'Just-updated data confirmation'
+                ]
+            }
+        },
+        'django_setup': '''
+        DATABASES = {
+            'default': {
+                'ENGINE': 'django.db.backends.postgresql',
+                'HOST': 'primary',
+                'READ_HOSTS': ['replica1', 'replica2'],
+            }
+        }
+        
+        # Use django-multidb-router
+        MASTER_DATABASES = ['default']
+        REPLICA_DATABASES = ['replica1', 'replica2']
+        '''
+    },
+    
+    'sql_performance_monitoring': {
+        'pg_stat_statements': {
+            'enabled': True,
+            'track': 'all',
+            'max': 10000,
+            'metrics': [
+                'total_time',
+                'calls',
+                'mean_time',
+                'stddev_time',
+                'rows'
+            ],
+            'alerts': 'Alert if query mean_time > 100ms or calls > 1000/hour'
+        },
+        'django_debug_toolbar': {
+            'enabled': 'DEVELOPMENT only',
+            'panels': ['sql', 'cache', 'signals'],
+            'threshold': 'Highlight queries > 100ms'
+        },
+        'nplusone': {
+            'library': 'nplusone',
+            'enabled': True,
+            'alert': 'Log warnings for N+1 queries in development'
+        },
+        'sentry_performance': {
+            'enabled': True,
+            'trace_sample_rate': 0.1,  # 10% of requests
+            'db_monitoring': True
+        }
+    }
+}
+```
+
+---
+
+## 7. COMPLIANCE & REGULATORY FRAMEWORK
+
+### 7.1 GST Compliance - Automated Engine
+
+#### 7.1.1 GST Calculation & Validation System
+```python
+gst_compliance_engine = {
+    'calculation_rules': {
+        'standard_rated': {
+            'rate': 0.09,  # 9% as of 2024
+            'applies_to': 'Most local sales of goods and services',
+            'formula': 'taxable_amount × 0.09',
+            'rounding': 'Round to nearest cent (HALF_UP)',
+            'examples': [
+                'Retail products sold in Singapore',
+                'Consulting services to local clients',
+                'Restaurant meals'
+            ]
+        },
+        'zero_rated': {
+            'rate': 0.0,
+            'applies_to': 'Export of goods and international services',
+            'documentation_required': [
+                'Export permit',
+                'Bill of lading / airway bill',
+                'Proof of payment from overseas customer'
+            ],
+            'invoice_text': 'Zero-rated supply (0% GST)',
+            'examples': ['Products shipped overseas', 'Services performed for overseas client']
+        },
+        'exempt': {
+            'rate': None,
+            'applies_to': 'Financial services, residential property, education',
+            'invoice_text': 'Exempt supply',
+            'examples': ['Bank fees', 'School tuition', 'Rental of residential property']
+        },
+        'out_of_scope': {
+            'rate': None,
+            'applies_to': 'Overseas services, transactions outside Singapore',
+            'invoice_text': 'Out of scope (no GST)',
+            'examples': ['Services performed entirely overseas', 'Third-country sales']
+        },
+        'special_cases': {
+            'mixed_supplies': {
+                'description': 'Invoice with both standard-rated and zero-rated items',
+                'treatment': 'Calculate GST separately for each line item',
+                'reporting': 'Show GST breakdown per line on invoice, aggregate in F5 boxes'
+            },
+            'deposit': {
+                'description': 'Deposit received before supply',
+                'treatment': 'GST is accounted for on deposit receipt',
+                'formula': 'deposit_amount × 9%'
+            },
+            'progress_payment': {
+                'description': 'Construction or long-term contract',
+                'treatment': 'Account for GST on each progress payment',
+                'final_claim': 'Make tax adjustment if final amount differs'
+            }
+        }
+    },
+    
+    'transaction_classification': {
+        'auto_determination': {
+            'product_gst_type': 'Use product.gst_type as primary determinant',
+            'customer_location': 'If customer.shipping_address.country != "SG": zero-rated',
+            'company_gst_status': 'If not GST-registered: all supplies exempt',
+            'invoice_rules': {
+                'simplified_invoice': 'Amount <= S$1000: less details required',
+                'tax_invoice': 'Amount > S$1000: full details including GST registration number',
+                'required_fields': [
+                    'Supplier name, address, GST registration number',
+                    'Customer name, address',
+                    'Invoice date, number',
+                    'Description, quantity, price of supply',
+                    'GST amount and rate',
+                    'Total amount payable'
+                ]
+            }
+        },
+        'override_capability': {
+            'admin_override': 'Admin can change GST type per transaction with audit trail',
+            'reason_required': 'Must provide reason for override (e.g., special export arrangement)',
+            'validation': 'Show warning if override creates compliance risk'
+        }
+    },
+    
+    'gst_registration_monitoring': {
+        'threshold': 1000000,  # S$1 million annual turnover
+        'warning_level': 0.9,  # Alert at 90% of threshold
+        'calculation': 'Rolling 12-month revenue from order.created_at',
+        'alert_workflow': {
+            '90_percent': {
+                'action': 'Send email to business owner and accountant',
+                'message': 'Approaching GST registration threshold (90%)',
+                'recommendation': 'Prepare GST registration documents'
+            },
+            'threshold_exceeded': {
+                'action': 'Send critical alert to all admins',
+                'message': 'GST registration threshold exceeded - registration required within 30 days',
+                'consequences': 'Penalties for late registration up to S$10,000'
+            }
+        },
+        'registration_support': {
+            'document_checklist': 'Generate list of required documents',
+            'timeline': 'Track 30-day registration deadline',
+            'status': 'Monitor application status with IRAS'
+        }
+    },
+    
+    'f5_return_generation': {
+        'frequency': 'Quarterly (default), Monthly (optional)',
+        'quarters': {
+            'Q1': 'Jan 1 - Mar 31, due Apr 30',
+            'Q2': 'Apr 1 - Jun 30, due Jul 31',
+            'Q3': 'Jul 1 - Sep 30, due Oct 31',
+            'Q4': 'Oct 1 - Dec 31, due Jan 31 (next year)'
+        },
+        'boxes_calculation': {
+            'box_1': 'SUM(sales.net_amount WHERE gst_type = "standard_rated")',
+            'box_2': 'SUM(sales.net_amount WHERE gst_type = "zero_rated")',
+            'box_3': 'SUM(sales.net_amount WHERE gst_type = "exempt")',
+            'box_4': 'Box_1 + Box_2 + Box_3 (total supplies)',
+            'box_5': 'SUM(purchases.net_amount WHERE gst_type IN ("standard_rated", "zero_rated"))',
+            'box_6': 'SUM(sales.gst_amount WHERE gst_type = "standard_rated")',
+            'box_7': 'SUM(purchases.gst_amount WHERE gst_type = "standard_rated")',
+            'box_8': 'Box_6 - Box_7 (net GST payable/refundable)'
+        },
+        'validations': {
+            'box_4_verification': 'Must equal Box_1 + Box_2 + Box_3 (within rounding tolerance)',
+            'input_tax_limit': 'Box_7 cannot exceed Box_5 (cannot claim input tax > taxable purchases)',
+            'net_gst_reasonableness': 'Box_8 should be within expected range based on sales volume',
+            'missing_data_check': 'Flag if any required transactions are unclassified'
+        },
+        'automated_journal_entry': {
+            'trigger': 'Upon F5 submission',
+            'entry': 'Dr/Cr GST Payable (based on Box_8), Cr/Dr Bank/Cash',
+            'posting_date': 'Last day of quarter'
+        }
+    },
+    
+    'f7_bad_debt_relief': {
+        'eligibility': {
+            'conditions': [
+                'Debt > 6 months overdue',
+                'Reasonable collection efforts made',
+                'Debt written off in business accounts',
+                'Output tax previously accounted for'
+            ],
+            'calculation': 'Box_1: Outstanding GST amount',
+            'claim_period': 'Within 4 years from date of supply'
+        },
+        'automation': {
+            'monitoring': 'Track AR aging > 180 days',
+            'reminder': 'Notify accountant of potential F7 claim',
+            'documentation': 'Gather collection attempt evidence'
+        }
+    },
+    
+    'ir_asia_submission': {
+        'method': 'myTax Portal integration via CorpPass',
+        'authentication': 'CorpPass digital certificate',
+        'submission_modes': {
+            'direct_api': 'Preferred - automated submission via IRAS API',
+            'file_upload': 'Fallback - generate .txt file for manual upload',
+            'form_filling': 'Last resort - pre-populate web form'
+        },
+        'submission_workflow': {
+            'validation': 'Run 20+ validation checks before submission',
+            'approval': 'Require business owner or accountant approval',
+            'submit': 'POST to IRAS API with signed payload',
+            'acknowledgment': 'Receive IRAS Acknowledgement Reference Number',
+            'payment': 'If Box_8 is positive: schedule GIRO payment',
+            'refund': 'If Box_8 is negative: file for GST refund'
+        },
+        'error_handling': {
+            'rejection_reasons': [
+                'Invalid GST registration number',
+                'Box totals do not tally',
+                'Negative values in tax fields',
+                'Missing mandatory fields'
+            ],
+            'retry': 'Correct errors and resubmit within 3 days'
+        },
+        'proof_of_filing': {
+            'storage': 'Encrypted PDF of submitted F5 with IRAS acknowledgment',
+            'retention': '7 years as per IRAS requirement',
+            'accessibility': 'Retrievable within 5 minutes for audit'
+        }
+    },
+    
+    'zero_rating_validation': {
+        'export_supply_evidence': [
+            'Export permit from Singapore Customs',
+            'Bill of lading or airway bill',
+            'Proof of payment from overseas customer',
+            'Delivery note with overseas address',
+            'Insurance documents for shipment'
+        ],
+        'document_verification': {
+            'automated': 'Check shipping address country != "SG"',
+            'manual': 'Upload and attach export documents to invoice',
+            'audit_trail': 'Link documents to zero-rated transactions'
+        },
+        'compliance_risk': 'IRAS audits zero-rated supplies heavily - ensure complete documentation',
+        'warning_system': 'Flag zero-rated transactions without attached documents'
+    },
+    
+    'gst_audit_support': {
+        'audit_trail': {
+            'granularity': 'Every GST calculation logged with inputs and outputs',
+            'immutability': 'Tamper-proof append-only log for GST-related journal entries',
+            'retention': '7 years as per IRAS requirement'
+        },
+        'reporting_package': {
+            'contents': [
+                'GST F5 returns (all periods)',
+                'Detailed GST transaction listing',
+                'Supporting documents for zero-rated supplies',
+                'Import GST claims with customs documents',
+                'Bad debt relief claims (F7)',
+                'Audit-adjusted GST computations (if any)'
+            ],
+            'generation': 'One-click export from admin dashboard',
+            'format': 'PDF reports + Excel data + scanned documents zip'
+        },
+        'common_audit_issues': {
+            'understated_output_tax': 'Check: incomplete sales recording, incorrect GST treatment',
+            'overstated input_tax': 'Check: non-business expenses, blocked input tax',
+            'incorrect_zero_rating': 'Check: missing export documents, domestic sales misclassified',
+            'late filing': 'Automated reminders 7 days before deadline'
+        }
+    }
+}
+```
+
+#### 7.1.2 InvoiceNow (PEPPOL) Integration
+```python
+invoice_now_integration = {
+    'peppol_framework': {
+        'what_is_invoice_now': 'Singapore\'s e-invoicing framework based on PEPPOL BIS 3.0',
+        'benefits': [
+            'Faster payment cycles (5-7 days reduction)',
+            'Reduced errors (no manual data entry)',
+            'Cost savings (S$3-5 per invoice)',
+            'Cross-border compatibility'
+        ],
+        'mandatory_for': 'Government procurement (S$1M+ contracts from 2023)'
+    },
+    
+    'technical_setup': {
+        'access_point_provider': [
+            'CrimsonLogic (recommended)',
+            'Celtrino',
+            'TradeLink',
+            'Gebiz'
+        ],
+        'registration_process': {
+            'step_1': 'Choose Access Point Provider (APP)',
+            'step_2': 'Register company details and UEN',
+            'step_3': 'Receive PEPPOL Participant ID (0195:<UEN>)',
+            'step_4': 'Test connectivity with APP sandbox',
+            'step_5': 'Configure digital certificate'
+        },
+        'digital_certificate': {
+            'type': 'X.509 certificate for signing invoices',
+            'provider': 'APP or self-managed',
+            'renewal': 'Annual',
+            'storage': 'AWS Certificate Manager'
+        }
+    },
+    
+    'invoice_generation': {
+        'peppol_xml_structure': {
+            'header': {
+                'invoice_number': 'Unique invoice number',
+                'issue_date': 'YYYY-MM-DD',
+                'due_date': 'YYYY-MM-DD',
+                'currency': 'SGD',
+                'document_type': '380'  # Commercial invoice
+            },
+            'supplier_party': {
+                'endpoint_id': '0195:123456789A',  # PEPPOL ID
+                'company_name': 'StyleCo Singapore Pte Ltd',
+                'gst_reg_no': 'GST12345678',
+                'address': {
+                    'street': '123 Orchard Road',
+                    'city': 'Singapore',
+                    'postal_code': '238863',
+                    'country': 'SG'
+                },
+                'contact': {
+                    'email': 'billing@styleco.sg',
+                    'phone': '+65 6123 4567'
+                }
+            },
+            'customer_party': {
+                'endpoint_id': '0195:987654321B',
+                'company_name': 'Customer Company',
+                'gst_reg_no': 'GST87654321',
+                'address': {...}
+            },
+            'line_items': [
+                {
+                    'line_id': '1',
+                    'name': 'White Summer Dress',
+                    'quantity': 2,
+                    'unit_code': 'EA',
+                    'price': 89.99,
+                    'line_total': 179.98,
+                    'tax_category': 'S',  # Standard rated
+                    'tax_rate': 9.00,
+                    'tax_amount': 16.20
+                }
+            ],
+            'tax_summary': {
+                'taxable_amount': 179.98,
+                'tax_amount': 16.20,
+                'total_amount': 196.18
+            },
+            'payment_means': {
+                'type': '01',  # Bank transfer
+                'account_number': '123456789',
+                'bank_code': 'DBS'
+            }
+        },
+        'xml_generation': {
+            'library': 'lxml with XSD validation',
+            'validation': 'Strict PEPPOL BIS 3.0 XSD validation',
+            'error_handling': 'Detailed validation errors with line numbers'
+        },
+        'digital_signature': {
+            'method': 'XMLDsig with X.509 certificate',
+            'canonicalization': 'InclusiveNamespaces',
+            'digest_algorithm': 'SHA256',
+            'signature_algorithm': 'RSA-SHA256'
+        }
+    },
+    
+    'submission_workflow': {
+        'sync_with_billing': {
+            'trigger': 'When invoice status changes to "sent"',
+            'action': 'Auto-generate PEPPOL invoice and submit'
+        },
+        'api_call': {
+            'endpoint': 'https://api.accesspoint.com/v1/send-invoice',
+            'authentication': 'API key + HMAC signature',
+            'payload': 'Signed XML document',
+            'timeout': 30 seconds
+        },
+        'response_handling': {
+            'success': {
+                'status_code': 200,
+                'body': {'invoice_id': 'INV-98765', 'status': 'delivered'},
+                'action': 'Update invoice.peppol_status = "delivered"'
+            },
+            'retryable_errors': [408, 429, 503, 504],
+            'non_retryable_errors': [400, 401, 403, 422],
+            'retry_policy': 'Exponential backoff: 1min, 5min, 15min, 30min'
+        }
+    },
+    
+    'receive_invoices_from_suppliers': {
+        'webhook_endpoint': 'https://api.sg-smb-ecommerce.com/webhooks/peppol',
+        'security': 'HMAC signature verification',
+        'processing': {
+            'step_1': 'Validate XML signature and integrity',
+            'step_2': 'Extract invoice data to JSON',
+            'step_3': 'Create supplier bill in accounting system',
+            'step_4': 'Match with PO if reference provided',
+            'step_5': 'Queue for approval workflow'
+        },
+        'auto_matching': {
+            'po_match': 'If invoice.reference matches PO.number',
+            'supplier_match': 'Match by supplier PEPPOL ID',
+            'three_way_match': 'PO vs GRN vs Invoice'
+        }
+    },
+    
+    'integration_with_accounting': {
+        'workflow': {
+            'outbound': 'Invoice created → Generate PEPPOL XML → Submit to APP',
+            'inbound': 'Peppol invoice received → Create supplier bill → 3-way match → Approve → Pay'
+        },
+        'automation_level': 'Fully automated for outbound, semi-automated for inbound',
+        'data_mapping': {
+            'peppol_to_bill': {
+                'InvoiceNumber': 'Supplier bill number',
+                'IssueDate': 'Bill date',
+                'SupplierParty': 'Supplier lookup by UEN/GST',
+                'LineItems': 'Bill line items',
+                'TaxSummary': 'GST breakdown'
+            }
+        }
+    },
+    
+    'monitoring_and_metrics': {
+        'delivered_rate': 'Target > 98% of invoices delivered successfully',
+        'processing_time': 'End-to-end < 5 minutes',
+        'error_rate': '< 1% of submissions fail permanently',
+        'supplier_adoption': 'Track % of suppliers on PEPPOL network',
+        'dashboard': 'Real-time status of all PEPPOL invoices sent/received'
+    }
+}
+```
+
+### 7.2 PDPA Compliance Framework
+
+#### 7.2.1 Consent Management & Data Subject Rights
+```python
+pdpa_compliance_framework = {
+    'consent_obtainment': {
+        'purposes': {
+            'order_processing': {
+                'type': 'Mandatory',
+                'consent_required': 'Implied consent (necessary for contract)',
+                'withdrawal_impact': 'Cannot place orders',
+                'withdrawal_handling': 'Explain consequence, offer data deletion'
+            },
+            'marketing_communications': {
+                'type': 'Optional',
+                'consent_required': 'Explicit opt-in (checkbox, not pre-ticked)',
+                'granularity': 'Separate consent for email, SMS, push notifications',
+                'withdrawal_impact': 'Continue receiving service communications (order updates)',
+                'frequency_limits': 'Max 2 marketing emails per week'
+            },
+            'analytics_improvement': {
+                'type': 'Optional',
+                'consent_required': 'Explicit opt-in',
+                'description': 'Track usage patterns to improve platform',
+                'data_usage': 'Anonymized/pseudonymized where possible',
+                'withdrawal_impact': 'No impact on core functionality'
+            },
+            'third_party_sharing': {
+                'type': 'Optional',
+                'consent_required': 'Explicit opt-in',
+                'third_parties': ['Payment gateways', 'Logistics providers', 'Accounting software'],
+                'data_disclosed': 'Name, address, contact info, order details',
+                'withdrawal_impact': 'Limited payment/shipping options'
+            },
+            'legal_compliance': {
+                'type': 'Mandatory',
+                'consent_required': 'Not required (legal obligation)',
+                'basis': 'IRAS tax requirements, ACRA filings',
+                'retention': '7 years as per Singapore law'
+            }
+        },
+        
+        'consent_interface': {
+            'signup_form': {
+                'presentation': 'Clear checkboxes with purpose descriptions',
+                'bundling': 'NOT allowed - each purpose separate checkbox',
+                'language': 'Plain English (not legalese)',
+                'examples': [
+                    '☐ Send me promotional offers via email (you can unsubscribe anytime)',
+                    '☐ Share my data with logistics partners for delivery (required for shipping)'
+                ]
+            },
+            'record_keeping': {
+                'data_captured': {
+                    'consent_granted': True/False,
+                    'timestamp': '2024-12-17T10:30:00+08:00',
+                    'method': 'explicit',
+                    'ip_address': '203.116.1.234',
+                    'user_agent': 'Mozilla/5.0...',
+                    'consent_version': '2.1',
+                    'language': 'en'
+                },
+                'storage': 'Immutable log in audit_logs table',
+                'retention': '7 years or duration of customer relationship + 1 year'
+            }
+        },
+        
+        'withdrawal_mechanism': {
+            'ease': 'As easy to withdraw as to give consent',
+            'access': 'Prominent "Privacy Settings" link in account menu',
+            'process': [
+                'Customer navigates to Privacy Settings',
+                'Toggles off consent for specific purpose',
+                'System processes withdrawal within 24 hours',
+                'Confirmation email sent'
+            ],
+            'data_handling': {
+                'marketing': 'Stop sending within 24 hours, mark as unsubscribed',
+                'analytics': 'Stop collecting personal data, anonymize historical data',
+                'third_party': 'Notify partners to stop processing, request deletion',
+                'order_processing': 'Cannot withdraw (contract necessity), but offer data minimization'
+            },
+            'consequences': 'Clearly explain what will stop working'
+        }
+    },
+    
+    'data_subject_access_requests': {
+        'request_types': {
+            'access': {
+                'description': 'Obtain copy of all personal data',
+                'timeline': '30 days',
+                'format': 'Machine-readable JSON + human-readable PDF',
+                'cost': 'Free for first request, reasonable fee for subsequent requests'
+            },
+            'correction': {
+                'description': 'Correct inaccurate personal data',
+                'timeline': '30 days',
+                'validation': 'Verify corrected data (e.g., email verification)',
+                'audit': 'Log correction with old/new values'
+            },
+            'deletion': {
+                'description': 'Erasure of personal data (right to be forgotten)',
+                'timeline': '30 days',
+                'exceptions': [
+                    'Legal obligation to retain (IRAS: 7 years)',
+                    'Ongoing contract performance',
+                    'Legitimate business interests',
+                    'Exercising/defending legal claims'
+                ],
+                'process': [
+                    'Verify identity',
+                    'Assess if any exceptions apply',
+                    'Delete from primary database',
+                    'Request deletion from third parties',
+                    'Delete from backups within 90 days'
+                ],
+                'soft_delete': 'Set deleted_at timestamp, purge after legal retention period'
+            },
+            'portability': {
+                'description': 'Receive data in structured, machine-readable format',
+                'format': 'JSON, CSV, or Excel',
+                'content': 'All data customer provided to platform',
+                'exclusions': 'Data created by business (analytics, recommendations)'
+            }
+        },
+        
+        'request_workflow': {
+            'submission': {
+                'channels': [
+                    'In-app "Download My Data" button',
+                    'Email to privacy@sgsmb.com',
+                    'Physical mail (less common)'
+                ],
+                'verification': [
+                    'Login authentication',
+                    'OTP to registered phone/email',
+                    'Identity document upload if needed'
+                ]
+            },
+            
+            'processing': {
+                'data_collection': 'Gather from all tables: orders, addresses, payment methods, consents',
+                'formatting': 'Generate structured JSON + summary PDF',
+                'review': 'Legal/compliance team reviews sensitive data',
+                'secure_transfer': 'Password-protected zip file or secure portal download',
+                'notification': 'Email with download link and password via SMS'
+            },
+            
+            'timeline_tracking': {
+                'request_received': '2024-12-17',
+                'due_date': '2025-01-16',  # +30 days
+                'processing_started': '2024-12-20',
+                'processing_completed': '2025-01-10',
+                'response_sent': '2025-01-12'
+            }
+        },
+        
+        'automation': {
+            'access_request': 'One-click generation of data report',
+            'deletion_request': 'Semi-automated with manual approval for exceptions',
+            'reminders': 'Escalate if processing not started within 20 days'
+        }
+    },
+    
+    'data_minimization': {
+        'principle': 'Collect only what is necessary, retain only as long as needed',
+        
+        'collection': {
+            'mandatory_fields': {
+                'customer': ['email', 'name', 'shipping_address'],
+                'order': ['items', 'payment_method', 'shipping_address'],
+                'rationale': 'Required to perform contract'
+            },
+            'optional_fields': {
+                'customer': ['phone', 'date_of_birth', 'marketing_preferences'],
+                'order': ['reference_number', 'gift_message'],
+                'rationale': 'Enhance service but not essential'
+            },
+            'prohibited_fields': {
+                'customer': ['NRIC (unless required by law)', 'religion', 'political views'],
+                'order': [],
+                'rationale': 'PDPA restricts sensitive personal data'
+            },
+            'validation': 'Form validation prevents submission of prohibited fields'
+        },
+        
+        'retention': {
+            'policies': {
+                'customer_profile': 'Duration of relationship + 1 year after account closure',
+                'order_history': '7 years (IRAS requirement)',
+                'payment_method': 'Until payment completed + 1 year',
+                'marketing_consent': 'Until withdrawn + 6 months',
+                'system_logs': '90 days online, 1 year archived',
+                'backup_data': '30 days (rolling)'
+            },
+            
+            'automated_deletion': {
+                'schedule': 'Daily batch job at 2 AM',
+                'logic': '''
+                    DELETE FROM marketing_contacts 
+                    WHERE consent_withdrawn_at < NOW() - INTERVAL '6 months';
+                    
+                    UPDATE orders SET customer_email = 'anonymized@deleted.com' 
+                    WHERE created_at < NOW() - INTERVAL '7 years' AND status = 'delivered';
+                ''',
+                'confirmation': 'Log deleted records, send summary to admin'
+            }
+        }
+    },
+    
+    'data_protection_measures': {
+        'encryption': {
+            'at_rest': {
+                'database': 'Transparent Data Encryption (TDE) in PostgreSQL',
+                'files': 'AES-256 encryption for uploaded files in S3',
+                'backups': 'Encrypted with unique keys per backup'
+            },
+            'in_transit': {
+                'protocol': 'TLS 1.3 for all API communications',
+                'certificate': 'Wildcard certificate from ACM',
+                'hsts': 'Strict-Transport-Security: max-age=31536000; includeSubDomains; preload'
+            },
+            'field_level': {
+                'fields': ['credit_card_token', 'nric', 'password_hash'],
+                'method': 'AES-256 with key rotation every 90 days',
+                'access': 'Only specific functions can decrypt'
+            }
+        },
+        
+        'access_control': {
+            'principle': 'Least privilege - grant minimum necessary access',
+            'implementation': {
+                'authentication': '2FA mandatory for admin roles',
+                'authorization': 'RBAC with granular permissions',
+                'session': '30-minute timeout, concurrent session limit (3)',
+                'ip_restrictions': 'Admin access from office IP only'
+            },
+            'monitoring': {
+                'access_logs': 'Log every data access with user_id, timestamp, record_id',
+                'anomaly_detection': 'Alert on unusual access patterns',
+                'quarterly_review': 'Review access rights and remove unnecessary permissions'
+            }
+        },
+        
+        'third_party_management': {
+            'due_diligence': {
+                'before_sharing': [
+                    'Review APP privacy policy',
+                    'Check data center location (must be in approved countries)',
+                    'Verify security certifications (ISO 27001, SOC 2)',
+                    'Sign Data Processing Agreement'
+                ],
+                'restricted_countries': ['No data transfer outside SG unless explicitly consented']
+            },
+            
+            'data_processing_agreements': {
+                'required_clauses': [
+                    'Purpose limitation',
+                    'Data minimization',
+                    'Security measures',
+                    'Sub-processing restrictions',
+                    'Audit rights',
+                    'Breach notification (within 24 hours)',
+                    'Return/deletion after termination'
+                ],
+                'partners': ['Stripe', 'HitPay', 'Ninja Van', 'Xero']
+            },
+            
+            'onward_transfer': {
+                'notification': 'Notify customer if data will be transferred to sub-processor',
+                'consent': 'Obtain explicit consent for sensitive data',
+                'tracking': 'Maintain register of all sub-processors'
+            }
+        }
+    },
+    
+    'data_breach_response': {
+        'detection': {
+            'sources': [
+                'SIEM alerts (Splunk)',
+                'Failed login spikes',
+                'Unusual data export volumes',
+                'Employee reports',
+                'Customer complaints'
+            ],
+            'monitoring': '24/7 security operations center'
+        },
+        
+        'response_timeline': {
+            '0_4_hours': {
+                'actions': [
+                    'Contain breach (isolate affected systems)',
+                    'Assess scope and impact',
+                    'Preserve evidence',
+                    'Notify internal incident response team'
+                ],
+                'owner': 'Security team lead'
+            },
+            '4_24_hours': {
+                'actions': [
+                    'Complete impact assessment',
+                    'Identify affected individuals',
+                    'Determine if PDPC notification required',
+                    'Draft notification messages'
+                ],
+                'owner': 'Data protection officer'
+            },
+            '24_72_hours': {
+                'actions': [
+                    'Notify PDPC (if required)',
+                    'Notify affected individuals (if high risk)',
+                    'Implement remediation measures',
+                    'Prepare public statement (if necessary)'
+                ],
+                'owner': 'CEO + Legal counsel'
+            }
+        },
+        
+        'pdpc_notification': {
+            'when_required': 'If breach causes harm OR involves large scale (>500 individuals)',
+            'content': [
+                'Nature of breach',
+                'Types of personal data affected',
+                'Number of individuals affected',
+                'Potential consequences',
+                'Mitigation measures taken',
+                'Contact details for inquiries',
+                'Timeline of events'
+            ],
+            'method': 'Online notification form on PDPC website',
+            'deadline': 'Within 72 hours of becoming aware'
+        },
+        
+        'individual_notification': {
+            'when_required': 'If breach likely to cause harm (identity theft, financial loss, etc.)',
+            'content': [
+                'What happened',
+                'What data was affected',
+                'What we are doing',
+                'What you should do (protective measures)',
+                'Contact information',
+                'Complimentary services (credit monitoring if financial data)'
+            ],
+            'channels': ['Email (primary)', 'SMS (urgent)', 'Registered mail (sensitive)'],
+            'prohibition': 'Do NOT delay notification to investigate cause'
+        },
+        
+        'remediation_and_lessons_learned': {
+            'after_containment': [
+                'Root cause analysis (5 Whys)',
+                'Implement technical fixes',
+                'Update policies and procedures',
+                'Retrain staff if human error',
+                'Review and enhance security measures'
+            ],
+            'lessons_learned_session': 'Within 1 week of breach containment',
+            'documentation': 'Update incident response playbook'
+        }
+    },
+    
+    'compliance_monitoring_and_assurance': {
+        'regular_audits': {
+            'frequency': 'Quarterly internal audit, Annual external audit',
+            'scope': [
+                'Consent records completeness',
+                'Data retention compliance',
+                'Access review',
+                'Third party compliance',
+                'Breach response readiness'
+            ],
+            'reporting': 'Executive summary to management committee'
+        },
+        
+        'pdpc_framework_alignment': {
+            'mapping': 'Map all requirements to Data Protection Provisions',
+            'gaps': 'Identify and remediate compliance gaps',
+            'certification': 'Consider Data Protection Trustmark (DPTM)'
+        },
+        
+        'training_and_awareness': {
+            'frequency': 'Initial onboarding + annual refresher',
+            'content': [
+                'PDPA basics',
+                'Company data protection policies',
+                'Incident reporting procedures',
+                'Social engineering awareness'
+            ],
+            'audience': 'All staff, especially those with data access',
+            'assessment': 'Quiz with 80% pass rate'
+        }
+    }
+}
+```
+
+### 7.3 Industry-Specific Compliance
+
+#### 7.3.1 License Management & Regulatory Integration
+```python
+industry_compliance_modules = {
+    'food_beverage_sfa': {
+        'licenses': {
+            'food_shop_license': {
+                'requirement': 'All food establishments preparing/serving food',
+                'authority': 'Singapore Food Agency (SFA)',
+                'application': 'GoBusiness Licensing Portal',
+                'validity': '1 year (renewable)',
+                'fee': 'S$195 - S$390 depending on size',
+                'processing_time': '4-6 weeks',
+                'prerequisites': [
+                    'Complete food safety training (SFA-approved)',
+                    'Pass health inspection',
+                    'Provide floor plan',
+                    'List of equipment',
+                    'Cleaning schedule'
+                ],
+                'integration_points': {
+                    'platform': 'Pull license status via SFA API',
+                    'expiry_alert': '90 days before expiry',
+                    'renewal': 'One-click renewal from admin dashboard',
+                    'inspection_alerts': 'Auto-schedule after critical stock movements'
+                }
+            },
+            
+            'halal_certification': {
+                'authority': 'Majlis Ugama Islam Singapura (MUIS)',
+                'types': ['Restaurant', 'Catering', 'Food preparation'],
+                'validity': '2 years',
+                'fee': 'S$600 - S$2,000',
+                'requirements': [
+                    'Halal Quality Management System',
+                    'Halal-trained person in charge',
+                    'Segregation of halal/non-halal ingredients',
+                    'Documentation system'
+                ],
+                'platform_integration': {
+                    'ingredient_tracking': 'Flag non-halal ingredients in inventory',
+                    'supplier_verification': 'Check supplier halal status',
+                    'audit_trail': 'Document all halal-related processes',
+                    'renewal_reminder': '120 days before expiry'
+                }
+            }
+        },
+        
+        'compliance_monitoring': {
+            'temperature_logs': {
+                'requirement': 'Daily temperature monitoring for fridges/freezers',
+                'automation': 'IoT sensors connected to platform',
+                'alerts': 'Immediate notification if temp outside safe range',
+                'recording': 'Automated log in compliance table',
+                'audit': 'One-click export for SFA inspection'
+            },
+            'cleaning_checklists': {
+                'requirement': 'Documented cleaning schedules',
+                'workflow': 'Staff check off tasks on tablet',
+                'verification': 'Manager reviews weekly',
+                'photos': 'Attach photos for critical cleaning steps'
+            },
+            'incident_reporting': {
+                'food_poisoning': 'Report to SFA within 24 hours',
+                'procedure': 'Built-in incident report form in platform',
+                'attachments': 'Medical reports, lab results',
+                'follow_up': 'Track corrective actions'
+            }
+        }
+    },
+    
+    'health_supplements_hsa': {
+        'product_registration': {
+            'categories': [
+                'Therapeutic products',
+                'Medical devices',
+                'Traditional medicines',
+                'Health supplements'
+            ],
+            'process': {
+                'timeline': '3-6 months',
+                'fee': 'S$650 - S$5,000',
+                'requirements': [
+                    'Product formulation details',
+                    'Safety and efficacy data',
+                    'Manufacturing process',
+                    'Quality control specifications',
+                    'Labelling information'
+                ]
+            },
+            'platform_integration': {
+                'registration_tracking': 'Track application status',
+                'document_management': 'Store all submitted documents',
+                'expiry_monitoring': 'Alert 90 days before product registration expiry',
+                'variant_management': 'Link variants to parent registration'
+            }
+        },
+        
+        'adverse_event_reporting': {
+            'requirement': 'Mandatory reporting of serious adverse events within 15 days',
+            'procedure': {
+                'customer_report': 'Form in customer portal',
+                'staff_report': 'Internal form with severity assessment',
+                'submission': 'Auto-generate HSA report format',
+                'follow_up': 'Track HSA response and actions'
+            },
+            'platform_features': {
+                'severity_scoring': 'Auto-calculate based on symptoms',
+                'escalation': 'Alert management and safety officer',
+                'submission': 'Upload to HSA PEMS portal via API',
+                'tracking': 'Monitor HSA review status'
+            }
+        },
+        
+        'batch_tracking': {
+            'regulation': 'Must track product batches for recall capability',
+            'implementation': {
+                'batch_number': 'Generated per GRN receipt',
+                'expiry_date': 'Mandatory for perishable items',
+                'quantity': 'Track down to individual unit',
+                'sales_linkage': 'Record batch in order line item',
+                'traceability': 'Full forward/backward traceability'
+            },
+            'recall_procedure': {
+                'initiation': 'One-click initiate product recall',
+                'notification': 'Auto-email customers who purchased batch',
+                'refund': 'Process automatic refunds',
+                'reporting': 'Notify HSA within 24 hours'
+            }
+        }
+    },
+    
+    'alcohol_spf': {
+        'liquor_license_types': {
+            'class_1a': {
+                'use': 'Restaurants and food establishments',
+                'hours': 'No sales 10:30 PM - 7:00 AM',
+                'extended_hours': 'Apply for extension (additional fee)',
+                'integration': {
+                    'pos_validation': 'Block sales during prohibited hours',
+                    'age_verification': 'ID scanner integration at checkout',
+                    'warning': 'Display warning if customer appears under 30'
+                }
+            },
+            'class_1b': {
+                'use': 'Pubs, bars, karaoke lounges',
+                'extended_hours': 'May apply for 24-hour license',
+                'specific_requirements': 'Security personnel, CCTV, incident log'
+            },
+            'class_2a': {
+                'use': 'Supermarkets, convenience stores',
+                'restriction': 'Cannot sell after 10:30 PM',
+                'pos_automation': 'Auto-disable alcohol SKUs after 10:30 PM'
+            }
+        },
+        
+        'age_verification': {
+            'requirement': 'Verify age for customers appearing under 25',
+            'pos_integration': {
+                'id_scanner': 'Scans NRIC/barcode',
+                'age_calculation': 'Auto-calculate age from birthdate',
+                'approval': 'Transaction approved if age >= 18',
+                'audit': 'Log all age-verified transactions',
+                'manual_override': 'Manager approval for manual verification'
+            },
+            'online_sales': {
+                'requirement': 'Age verification before adding to cart',
+                'implementation': 'NRIC verification via SingPass or upload ID',
+                'limitations': 'Accept delivery only to verified address'
+            },
+            'compliance_check': 'Daily report of all alcohol transactions, flag missing age verification'
+        },
+        
+        'incident_logging': {
+            'requirements': [
+                'All alcohol-related incidents must be logged',
+                'Include date, time, description, witnesses',
+                'Report to SPF quarterly'
+            ],
+            'platform_feature': {
+                'quick_log': 'Staff can log incident via mobile app',
+                'photo_upload': 'Attach photos of scene/damage',
+                'witness_info': 'Record witness details',
+                'spc_submission': 'Auto-generate quarterly report file',
+                'analysis': 'Identify patterns and implement preventive measures'
+            }
+        }
+    }
+}
+```
+
+---
+
+## 8. SECURITY IMPLEMENTATION - DEFENSE IN DEPTH
+
+### 8.1 Application Security Architecture
+
+#### 8.1.1 Authentication & Authorization
+```python
+security_architecture = {
+    'authentication_methods': {
+        'primary_jwt': {
+            'implementation': 'dj-rest-auth + simplejwt',
+            'access_lifetime': 15 minutes,
+            'refresh_lifetime': 7 days,
+            'rotation': 'Refresh token rotation on each use',
+            'algorithm': 'RS256',
+            'key_management': {
+                'public_key': 'Shared with services needing to verify tokens',
+                'private_key': 'Secured in AWS Secrets Manager, rotation every 90 days',
+                'backup': 'Multiple key versions active during rotation'
+            },
+            'claims': {
+                'iss': 'sg-smb-ecommerce-platform',
+                'aud': 'api.sg-smb-ecommerce.com',
+                'company_id': 'UUID',
+                'permissions': ['list', 'of', 'permissions'],
+                'roles': ['role1', 'role2'],
+                'auth_time': 'Timestamp of authentication',
+                'mfa_verified': True/False
+            },
+            'validation': {
+                'verify_signature': True,
+                'verify_exp': True,
+                'verify_iat': True,
+                'verify_aud': True,
+                'require_mfa_for_admin': True
+            }
+        },
+        
+        'api_keys': {
+            'use_case': 'Server-to-server integrations',
+            'format': 'sk_live_abc123... (32+ chars)',
+            'storage': 'Hashed in database (bcrypt), plain text shown once on creation',
+            'rate_limits': {
+                'default': '1000/hour',
+                'admin': '5000/hour',
+                'webhook': '500/hour'
+            },
+            'permissions': {
+                'read': 'GET endpoints',
+                'write': 'POST/PUT/PATCH',
+                'admin': 'DELETE, user management',
+                'billing': 'Access to financial data only'
+            },
+            'ip_whitelist': 'Optional restriction to specific IP ranges',
+            'last_used_tracking': 'Timestamp and IP of last API call',
+            'auto_revocation': 'If unused for 90 days or suspicious activity detected'
+        },
+        
+        'oauth2_providers': {
+            'google': {
+                'client_id': 'from_google_console',
+                'scopes': ['email', 'profile'],
+                'use_case': 'Customer login convenience'
+            },
+            'singpass': {
+                'client_id': 'from_singpass',
+                'scopes': ['openid', 'profile'],
+                'use_case': 'Secure government-grade authentication for business users',
+                'additional_claims': ['uinfin', 'name', 'gender']
+            },
+            'corppass': {
+                'client_id': 'from_corppass',
+                'scopes': ['openid', 'corppass.profile'],
+                'use_case': 'Company administrators and authorized officers',
+                'additional_claims': ['uen', 'company_name', 'roles']
+            }
+        },
+        
+        'multifactor_authentication': {
+            'methods': {
+                'totp': {
+                    'app': 'Google Authenticator, Authy, Microsoft Authenticator',
+                    'backup_codes': '10 backup codes generated on setup',
+                    'recovery': 'Email verification if authenticator lost'
+                },
+                'sms_otp': {
+                    'provider': 'Twilio',
+                    'length': '6 digits',
+                    'expiry': '5 minutes',
+                    'rate_limit': '5 attempts per 15 minutes'
+                },
+                'email_otp': {
+                    'provider': 'SendGrid',
+                    'length': '6 digits',
+                    'expiry': '10 minutes',
+                    'template': 'Branded email with OTP'
+                },
+                'webauthn': {
+                    'type': 'Hardware security keys (YubiKey, Titan)',
+                    'use_case': 'Super admin and business owner accounts',
+                    'backup': 'Must also configure TOTP as backup'
+                }
+            },
+            
+            'enforcement': {
+                'super_admin': 'MFA mandatory, cannot opt-out',
+                'business_owner': 'MFA mandatory during onboarding',
+                'accountant': 'MFA mandatory (access to sensitive financial data)',
+                'staff': 'Optional but encouraged (incentive: 5% discount)',
+                'customer': 'Optional, recommended for accounts with saved payment methods'
+            },
+            
+            'bypass_protection': {
+                'allow_bypass_after_mfa': False,  # Must re-auth if switching devices
+                'session_binding': True,  # MFA validity tied to device fingerprint',
+                'trusted_devices': 'Remember device for 30 days option'
+            }
+        }
+    },
+    
+    'authorization_model': {
+        'rbac': {
+            'definition': 'Role-Based Access Control',
+            'role_hierarchy': '''
+                super_admin
+                    └── business_owner
+                        ├── accountant
+                        ├── warehouse_manager
+                        └── sales_staff
+            ''',
+            'permissions_matrix': {
+                'super_admin': ['*.*'],  # All permissions on all resources
+                'business_owner': [
+                    'companies.manage',
+                    'products.manage',
+                    'orders.manage',
+                    'inventory.manage',
+                    'accounting.view',
+                    'users.manage',
+                    'reports.view'
+                ],
+                'accountant': [
+                    'accounting.manage',
+                    'accounting.view',
+                    'reports.view',
+                    'orders.view',
+                    'products.view'
+                ],
+                'warehouse_manager': [
+                    'inventory.manage',
+                    'orders.fulfill',
+                    'products.view',
+                    'purchase_orders.manage'
+                ],
+                'sales_staff': [
+                    'orders.manage',
+                    'customers.manage',
+                    'products.view',
+                    'reports.sales_view'
+                ],
+                'customer_service': [
+                    'orders.view',
+                    'customers.manage',
+                    'returns.manage'
+                ]
+            },
+            'assignment': 'Users assigned roles at company level',
+            'audit': 'Log all role assignments and permission changes'
+        },
+        
+        'object_level_permissions': {
+            'implementation': 'django-guardian',
+            'use_cases': [
+                'Customer can only view/edit their own orders',
+                'Staff can only access products in their category',
+                'Warehouse manager can only manage stock in their location',
+                'Regional manager can only see data for assigned regions'
+            ],
+            'performance': 'Use with caution - impacts query performance',
+            'caching': 'Cache permission checks for 5 minutes'
+        },
+        
+        'api_permissions': {
+            'scopes': {
+                'read': 'GET requests only',
+                'write': 'POST, PUT, PATCH on owned resources',
+                'admin': 'DELETE, manage other users resources',
+                'billing': 'Access to financial endpoints only'
+            },
+            'inheritance': 'API key permissions = intersection of key scopes & user permissions'
+        }
+    },
+    
+    'password_security': {
+        'policy': {
+            'min_length': 12,
+            'complexity': {
+                'uppercase': 1,
+                'lowercase': 1,
+                'numbers': 1,
+                'symbols': 1
+            },
+            'common_passwords': 'Check against top 10,000 common passwords',
+            'dictionary_words': 'Disallow single dictionary words',
+            'company_name': 'Disallow company name in password',
+            'personal_info': 'Disallow email, name, phone in password'
+        },
+        
+        'hashing': {
+            'algorithm': 'Argon2 (winner of Password Hashing Competition)',
+            'memory_cost': 65536,  # 64 MB
+            'time_cost': 3,
+            'parallelism': 1,
+            'salt': 'Random 128-bit per password'
+        },
+        
+        'expiry_and_rotation': {
+            'max_age': 90,  # days
+            'warning': 'Email warning 7 days before expiry',
+            'grace_logins': 3,
+            'force_change': 'On suspected compromise or employee role change'
+        },
+        
+        'history': {
+            'prevent_reuse': 'Last 5 passwords',
+            'minor_changes': 'Detect patterns (e.g., Password1 → Password2)',
+            'breach_check': 'Check against HaveIBeenPwned API',
+            'notification': 'Alert user if their password appears in breach'
+        }
+    },
+    
+    'session_security': {
+        'management': {
+            'store': 'Redis (not database)',
+            'serialization': 'Signed with SECRET_KEY',
+            'ttl': 1800,  # 30 minutes
+            'adapter': 'django.contrib.sessions.backends.cache'
+        },
+        
+        'refresh': {
+            'rolling_timeout': True,  # Extend on activity',
+            'max_duration': 8,  # hours (full workday)',
+            'remember_me': 'If checked: 30 days, use separate persistent cookie'
+        },
+        
+        'concurrent_login': {
+            'max_sessions': 3,
+            'behavior': 'Block new login if limit reached',
+            'user_action': 'View and revoke active sessions in account settings'
+        },
+        
+        'binding': {
+            'ip_binding': 'Allow session from single IP only',
+            'user_agent_binding': 'Invalidate session if User-Agent changes',
+            'geolocation_binding': 'Alert if login from new country'
+        },
+        
+        'protection_against': {
+            'session_fixation': 'Create new session ID on login',
+            'session_hijacking': 'HTTPS only, HSTS, secure cookies',
+            'csrf': 'Django built-in CSRF protection',
+            'xss': 'Content Security Policy headers'
+        },
+        
+        'logout': {
+            'clear': 'Remove from Redis + delete cookie',
+            'global_logout': 'Revoke all user sessions across devices',
+            'auto_logout': 'After 30 min inactivity or when browser closes'
+        }
+    },
+    
+    'api_security': {
+        'rate_limiting': {
+            'strategy': 'Token bucket',
+            'implementation': 'django-ratelimit',
+            'limits': {
+                'anonymous': '100/hour',
+                'authenticated': '1000/hour',
+                'api_key': '5000/hour',
+                'admin': '200/hour'  # More restrictive
+            },
+            'blocking': '429 Too Many Requests with Retry-After header',
+            'bypass': 'Rate limit bypass for super admin (monitor instead of block)'
+        },
+        
+        'cors': {
+            'allowed_origins': [
+                'https://store.com',
+                'https://admin.store.com',
+                'https://pos.store.com',
+                'http://localhost:3000'  # Dev only
+            ],
+            'allowed_methods': ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+            'credentials': 'true',
+            'max_age': 86400  # 24 hours preflight cache
+        },
+        
+        'input_validation': {
+            'framework': 'Django forms + DRF serializers',
+            'levels': [
+                'Field-level validation (type, length, format)',
+                'Object-level validation (business rules)',
+                'Custom validation (regex, external API)'
+            ],
+            'security_checks': [
+                'SQL injection prevention (ORM usage)',
+                'XSS prevention (auto-escaping)',
+                'Command injection (no shell calls)',
+                'Path traversal (custom file storage)',
+                'SSRF (url whitelist)',
+                'XXE (libxml2 hardening)'
+            ]
+        },
+        
+        'request_signing': {
+            'use_case': 'Webhook endpoints and high-value transactions',
+            'method': 'HMAC-SHA256',
+            'header': 'X-Signature',
+            'verification': '''
+                timestamp = request.headers['X-Timestamp']
+                nonce = request.headers['X-Nonce']
+                body = request.body.decode()
+                
+                expected_sig = hmac.new(
+                    secret_key.encode(),
+                    f'{timestamp}{nonce}{body}'.encode(),
+                    hashlib.sha256
+                ).hexdigest()
+                
+                if not hmac.compare_digest(expected_sig, request.headers['X-Signature']):
+                    raise SignatureVerificationError
+            '''
+        }
+    }
+}
+```
+
+#### 8.1.2 Data Protection & Encryption
+```python
+data_protection_measures = {
+    'encryption_at_rest': {
+        'database': {
+            'tde': 'Transparent Data Encryption in PostgreSQL',
+            'implementation': 'pgcrypto extension',
+            'method': 'AES-256-CBC',
+            'key_management': 'AWS KMS (key rotation every 90 days)',
+            'backup_encryption': 'pg_basebackup with encryption',
+            'replication_encryption': 'SSL for streaming replication'
+        },
+        
+        'files': {
+            'storage': 'S3 with server-side encryption (SSE-S3)',
+            'method': 'AES-256',
+            'additional': 'Client-side encryption for highly sensitive files',
+            'key': 'KMS-managed keys, auto-rotation',
+            'cdn': 'CloudFront signed URLs for private content'
+        },
+        
+        'secrets': {
+            'storage': 'AWS Secrets Manager',
+            'cache': 'Cached in memory for 5 minutes (not on disk)',
+            'rotation': 'Automatic for RDS credentials, manual for API keys',
+            'access': 'IAM roles only, no hardcoded credentials'
+        }
+    },
+    
+    'encryption_in_transit': {
+        'tls': {
+            'version': 'TLS 1.3 (enforce, disable fallback to 1.2)',
+            'certificate': 'ACM-issued wildcard cert',
+            'renewal': 'Automatic',
+            'pinning': 'Consider certificate pinning for mobile apps',
+            'ocsp': 'OCSP stapling enabled'
+        },
+        
+        'api_communications': {
+            'internal': 'mTLS via Istio service mesh',
+            'external': 'TLS with verified certificates',
+            'webhooks': 'HTTPS endpoints only, certificate validation'
+        },
+        
+        'email': {
+            'transport': 'TLS with STARTTLS',
+            'sensitive_content': 'PGP encryption for financial data',
+            'provider': 'SendGrid with enforced TLS'
+        }
+    },
+    
+    'data_masking': {
+        'show_last_four': {
+            'fields': ['credit_card', 'nric'],
+            'display': '****-****-1234',
+            'access': 'Full view only for authorized roles'
+        },
+        
+        'show_first_last': {
+            'fields': ['email'],
+            'display': 's****.c**@gmail.com',
+            'access': 'Full email only when necessary'
+        },
+        
+        'full_masking': {
+            'fields': ['password_hash', 'api_key'],
+            'display': '***MASKED***',
+            'access': 'Never displayed in UI'
+        },
+        
+        'dynamic_masking': {
+            'based_on': 'user_id',
+            'customers': 'See only their own data',
+            'staff': 'See data for assigned customers',
+            'managers': 'See all company data'
+        }
+    },
+    
+    'data_loss_prevention': {
+        'api_exfiltration': {
+            'rate_limiting': 'Prevent bulk data export',
+            'monitoring': 'Alert on sudden increase in download volume',
+            'restrictions': 'Admin approval for >1000 record exports'
+        },
+        
+        'sanitize_exports': {
+            'automatic': 'Remove PII from analytics exports',
+            'pseudonymization': 'Replace identifiers with hashes',
+            'suppression': 'Exclude columns with sensitive data'
+        },
+        
+        'usb_device_control': {
+            'pos_terminals': 'Block USB storage devices',
+            'developer_workstations': 'Allow only encrypted drives',
+            'production_servers': 'No USB ports enabled'
+        }
+    },
+    
+    'backup_security': {
+        'encryption': 'AES-256 before upload to S3',
+        'key_separation': 'Different key for backups than production',
+        'integrity': 'MD5 checksum verification',
+        'retention': {
+            'daily': '7 days',
+            'weekly': '4 weeks',
+            'monthly': '12 months',
+            'yearly': '7 years'
+        },
+        'testing': 'Quarterly restore test',
+        'immunity': 'Backups are append-only, cannot be deleted/corrupted'
+    }
+}
+```
+
+#### 8.1.3 Infrastructure & Network Security
+```python
+infrastructure_security = {
+    'network_segmentation': {
+        'vpc_architecture': {
+            'public_subnet': 'ALB, NAT Gateway',
+            'private_app_subnet': 'Application servers',
+            'private_db_subnet': 'Databases (multi-AZ)',
+            'isolated_subnet': 'Payment processing, backup storage'
+        },
+        
+        'security_groups': {
+            'web_sg': {
+                'ingress': '443 from ALB SG',
+                'egress': '5432 to db_sg, 6379 to redis_sg',
+                'description': 'Application servers'
+            },
+            'db_sg': {
+                'ingress': '5432 from web_sg, read replicas',
+                'egress': 'None',
+                'description': 'PostgreSQL databases'
+            },
+            'redis_sg': {
+                'ingress': '6379 from web_sg',
+                'egress': 'None',
+                'description': 'Redis cache and sessions'
+            },
+            'alb_sg': {
+                'ingress': '443 from Cloudflare IPs',
+                'egress': '443 to web_sg',
+                'description': 'Load balancers'
+            }
+        },
+        
+        'nacl_rules': {
+            'stateless': True,
+            'rules': 'Complement security groups with additional restrictions',
+            'example': 'Block all traffic from known malicious IPs'
+        }
+    },
+    
+    'ddos_protection': {
+        'cloudflare': {
+            'plan': 'Business with DDoS mitigation',
+            'rate_limiting': '100 requests/10s per IP',
+            'challenges': 'JS challenge for suspicious traffic',
+            'analytics': 'Real-time attack monitoring'
+        },
+        'aws_shield': {
+            'standard': 'Automatic protection',
+            'advanced': 'Dedicated DDoS expert, cost protection',
+            'implementation': 'Available for high-risk accounts'
+        },
+        'incident_response': {
+            'playbook': 'Escalation to Cloudflare and AWS support',
+            'communication': 'Notify customers if service affected',
+            'post_incident': 'Review and optimize protections'
+        }
+    },
+    
+    'intrusion_detection': {
+        'siem': {
+            'platform': 'Splunk Cloud or Elasticsearch SIEM',
+            'log_sources': [
+                'Application logs (auth, access)',
+                'Database logs (slow queries, errors)',
+                'System logs (SSH access, sudo commands)',
+                'Network logs (VPC Flow Logs)',
+                'CloudTrail logs (API calls)'
+            ],
+            'correlation_rules': [
+                'Multiple failed logins from same IP',
+                'Login from unusual country',
+                'Data exfiltration pattern',
+                'Privilege escalation attempts',
+                'Off-hours admin access'
+            ],
+            'alerts': 'PagerDuty for critical, Slack for warnings'
+        },
+        
+        'ids_ips': {
+            'suricata': 'Network IDS/IPS on VPC endpoints',
+            'ruleset': 'Emerging Threats Pro',
+            'action': 'Alert and block',
+            'integration': 'Auto-update rules daily'
+        },
+        
+        'honeypot': {
+            'purpose': 'Detect internal threats and lateral movement',
+            'implementation': 'Deploy fake vulnerable services',
+            'alert': 'Any interaction is suspicious'
+        }
+    },
+    
+    'bastion_host': {
+        'requirement': 'All SSH access to production servers',
+        'hardening': {
+            'os': 'Amazon Linux 2023',
+            'updates': 'Daily automatic security updates',
+            'monitoring': 'File integrity monitoring (AIDE)'
+        },
+        'access': {
+            'mfa': 'Google Authenticator required',
+            'session_recording': 'All sessions recorded and archived',
+            'command_logging': 'All commands logged to SIEM',
+            'sudo': 'Requires justification and approval'
+        },
+        'auditing': {
+            'frequency': 'Review access logs weekly',
+            'anomaly_detection': 'Alert on unusual patterns',
+            'managers': 'Managers notified when their team members access'
+        }
+    },
+    
+    'vulnerability_management': {
+        'scanning': {
+            'frequency': 'Weekly automated scans',
+            'tools': ['Nessus', 'OpenVAS'],
+            'scope': 'All production systems',
+            'depth': 'Deep scans with credentials'
+        },
+        
+        'prioritization': {
+            'cvss_9_10': 'Remediate within 24 hours',
+            'cvss_7_8': 'Remediate within 7 days',
+            'cvss_5_6': 'Remediate within 30 days',
+            'cvss_0_4': 'Remediate within 90 days'
+        },
+        
+        'patch_management': {
+            'os_updates': 'Automated via AWS Systems Manager',
+            'critical_patches': 'Apply within 24 hours of release',
+            'maintenance_window': 'Sundays 2-4 AM',
+            'testing': 'Staging deployment before production'
+        },
+        
+        'penetration_testing': {
+            'frequency': 'Quarterly by third-party',
+            'provider': 'Certified penetration testing firm',
+            'methodology': 'OWASP Testing Guide',
+            'scope': 'External network, web app, mobile app, API',
+            'reporting': 'Detailed report with remediation plan'
+        }
+    },
+    
+    'compliance_certifications': {
+        'pci_dss': {
+            'level': 'Level 1 Service Provider (if storing card data)',
+            'status': 'SAQ-D or ROC',
+            'requirements': [
+                'Secure network and systems',
+                'Protect cardholder data',
+                'Maintain vulnerability management program',
+                'Implement strong access control measures',
+                'Regularly monitor and test networks',
+                'Maintain information security policy'
+            ],
+            'validation': 'Quarterly network scans, annual assessment',
+            'responsibility': 'Shared with payment gateway (we handle transmission, not storage)'
+        },
+        
+        'soc_2_type_2': {
+            'status': 'Certified',
+            'trust_principles': ['Security', 'Availability', 'Confidentiality'],
+            'audit': 'Annual by AICPA firm',
+            'report': 'Available to enterprise customers under NDA'
+        },
+        
+        'iso_27001': {
+            'status': 'Certified',
+            'scope': 'Information security management system',
+            'audit': 'Annual surveillance audit',
+            'controls': '114 controls across 14 domains'
+        }
+    }
+}
+```
+
+---
+
+## 9. PERFORMANCE & SCALABILITY ENGINEERING
+
+### 9.1 Performance Targets & Benchmarks
+```python
+performance_sla = {
+    'response_time': {
+        'api_endpoints': {
+            'p50': '< 100ms',
+            'p95': '< 200ms',
+            'p99': '< 500ms',
+            'measurement': 'Via APM (Sentry, New Relic)'
+        },
+        'page_load': {
+            'mobile_first_contentful_paint': '< 1.8s',
+            'mobile_largest_contentful_paint': '< 2.5s',
+            'mobile_speed_index': '< 3.4s',
+            'mobile_time_to_interactive': '< 3.5s',
+            'desktop_pageload': '< 2.0s',
+            'measurement': 'Lighthouse CI in CICD pipeline'
+        },
+        'database_queries': {
+            'single_simple': '< 10ms',
+            'single_complex': '< 50ms',
+            'n_plus_one': 'Zero tolerance',
+            'measurement': 'Django Debug Toolbar (dev), Sentry (prod)'
+        }
+    },
+    
+    'throughput': {
+        'concurrent_users': 1000,
+        'orders_per_minute': 100,
+        'checkouts_per_minute': 50,
+        'inventory_updates_per_second': 100,
+        'search_queries_per_second': 200,
+        'measurement': 'Locust load tests'
+    },
+    
+    'availability': {
+        'uptime_sla': '99.9%',
+        'allowed_downtime': '43.8 minutes/month',
+        'maintenance_window': 'Sundays 2-4 AM (announced 7 days advance)',
+        'measurement': 'Pingdom + Uptime Robot',
+        'reporting': 'Monthly uptime report to customers'
+    },
+    
+    'data_consistency': {
+        'inventory': 'Realtime < 1 second sync across all channels',
+        'financials': 'Journal entries posted within 5 seconds of transaction',
+        'search_index': '< 30 seconds from product update to searchable',
+        'cache_invalidation': '< 5 seconds for critical keys'
+    }
+}
+```
+
+### 9.2 Scalability Architecture
+```python
+ scalability_design = {
+    'horizontal_scaling': {
+        'app_servers': {
+            'balancing': 'AWS ALB with sticky sessions (for cart)',
+            'algorithm': 'Least Outstanding Requests',
+            'health_checks': {
+                'endpoint': '/health/',
+                'interval': '30 seconds',
+                'timeout': '5 seconds',
+                'healthy_threshold': 2,
+                'unhealthy_threshold': 3
+            },
+            'session_affinity': {
+                'method': 'Stickiness by cookie (AWSALBAPP cookie)',
+                'duration': '1 day',
+                'override': 'Can be disabled for stateless requests'
+            }
+        },
+        
+        'database_read_scaling': {
+            'read_replicas': 3,
+            'routing': {
+                'writes': 'Primary only',
+                'reads': 'Load balance across replicas (random or weighted)',
+                'sticky_writes': 'Read-after-write from primary'
+            },
+            'replication_lag_handling': {
+                'monitoring': 'Alert if lag > 1 second',
+                'fallback': 'Route to primary if replica lag exceeds threshold',
+                'cache_compensation': 'Cache recently written data temporarily'
+            },
+            'analytics_workload': 'Route heavy reports to dedicated replica'
+        },
+        
+        'cache_scaling': {
+            'redis_cluster': {
+                'mode': 'Cluster with 3 masters, 3 slaves (automatic failover)',
+                'sharding': 'Hash slots 0-16383',
+                'key_distribution': 'Automatic based on CRC16',
+                'rebalancing': 'Manual rebalancing when adding/removing nodes'
+            },
+            'redis_sentinel': {
+                'mode': 'Sentinel for high availability',
+                'quorum': 2,  # 2 sentinels agree for failover
+                'failover_timeout': '30 seconds'
+            }
+        },
+        
+        'worker_scaling': {
+            'celery_workers': {
+                'min': 2,
+                'max': 20,
+                'scaling_trigger': 'Queue length',
+                'threshold': 'If queue > 100 tasks, add 2 workers'
+            },
+            'queue_prioritization': {
+                'high': 'Payment processing, inventory updates',
+                'medium': 'Email notifications, report generation',
+                'low': 'Data archiving, analytics aggregation'
+            }
+        }
+    },
+    
+    'vertical_scaling': {
+        'database_tiers': {
+            'startup': 'db.r5.large (2 vCPU, 16GB)',
+            'growth': 'db.r5.xlarge (4 vCPU, 32GB)',
+            'enterprise': 'db.r5.2xlarge (8 vCPU, 64GB)',
+            'scaling_trigger': 'CPU consistently > 70% or memory > 80%'
+        },
+        
+        'redis_tiers': {
+            'cache_size': '1GB → 6GB → 13GB as traffic grows',
+            'eviction_policy': 'LRU',
+            'maxmemory_policy': 'allkeys-lru'
+        },
+        
+        'elasticsearch': {
+            'node_count': '3 → 5 → 9',
+            'shards_per_index': '2 → 5 as data grows',
+            'replicas': 2
+        }
+    },
+    
+    'auto_scaling_policies': {
+        'ec2_app_servers': {
+            'metric': 'CPU utilization',
+            'target': 70,
+            'scale_out_cooldown': 180,  # seconds
+            'scale_in_cooldown': 300,
+            'min_count': 2,
+            'max_count': 20,
+            'predictive_scaling': 'Use machine learning to scale before predicted load'
+        },
+        
+        'rds_read_replicas': {
+            'metric': 'Average connection count',
+            'target': 100,
+            'add_replica_when': '3 consecutive metrics > 150',
+            'remove_replica_when': '7 consecutive metrics < 50'
+        },
+        
+        'redis': {
+            'metric': 'Cache hit ratio',
+            'target': 90,  # percent
+            'scale_up_when': 'Hit ratio < 85% for 10 minutes',
+            'scale_down_when': 'Hit ratio > 95% for 1 hour and memory < 50%'
+        }
+    },
+    
+    'microservices_future': {
+        'current_state': 'Monolithic Django app (appropriate for MVP)',
+        'future_split': {
+            'when': 'When team size > 15 engineers or deployment conflicts arise',
+            'candidates': [
+                'Notification service (SMS, email, push) → Node.js',
+                'Search service → Elasticsearch + Node.js API',
+                'File processing service (images, PDFs) → Go',
+                'Analytics service → Python (data science stack)',
+                'Payment gateway service → Go (high concurrency)'
+            ]
+        },
+        'transition_strategy': {
+            'strangler_fig': 'Gradually redirect traffic to new service',
+            'api_gateway': 'Route requests based on path/service',
+            'database': 'Shared initially, then split when stable'
+        }
+    }
+}
+```
+
+### 9.3 Performance Monitoring & Alerting
+```python
+performance_monitoring = {
+    'apm_tools': {
+        'sentry': {
+            'features': ['Error tracking', 'Performance monitoring', 'Session replay'],
+            'traces_sample_rate': 0.1,  # 10% of transactions
+            'alerts': 'Slack + PagerDuty integration',
+            'dashboard': 'Custom dashboards for key metrics'
+        },
+        'new_relic': {
+            'features': ['Application performance', 'Infrastructure monitoring', 'Browser monitoring'],
+            'apm_priority': 'High for business-critical transactions',
+            'synthetics': 'Uptime monitoring from 5 global locations'
+        },
+        'grafana': {
+            'data_sources': ['Prometheus', 'PostgreSQL', 'CloudWatch'],
+            'dashboards': [
+                'Business KPIs (orders, revenue)',
+                'Technical KPIs (latency, errors)',
+                'Infrastructure (CPU, memory, disk)'
+            ],
+            'refresh': 'Auto-refresh every 30 seconds for ops dashboard'
+        }
+    },
+    
+    'custom_metrics': {
+        'business_metrics': {
+            'orders_placed_total': 'Counter with labels: channel, status',
+            'orders_placed_rate': 'Rate per minute',
+            'revenue_total': 'Gauge with labels: currency',
+            'inventory_accuracy': 'Gauge (calculated from cycle counts)'
+        },
+        'application_metrics': {
+            'response_time_seconds': 'Histogram with labels: endpoint, method',
+            'database_query_duration': 'Histogram with labels: query_type, table',
+            'cache_hit_rate': 'Gauge per cache region',
+            'worker_queue_depth': 'Gauge per queue'
+        },
+        'infrastructure_metrics': {
+            'cpu_usage_percent': 'Gauge per instance',
+            'memory_usage_percent': 'Gauge',
+            'disk_usage_percent': 'Gauge',
+            'network_io_bytes': 'Counter'
+        }
+    },
+    
+    'alerting_rules': {
+        'critical_alerts': {
+            'response_time_p99': 'Alert if > 1000ms for 5 minutes',
+            'error_rate': 'Alert if 5xx rate > 1% for 2 minutes',
+            'database_down': 'Alert immediately',
+            'payment_gateway_error': 'Alert if > 10% payment failures',
+            'inventory_sync_lag': 'Alert if > 10 seconds'
+        },
+        
+        'warning_alerts': {
+            'response_time_p95': 'Warn if > 500ms for 10 minutes',
+            'cpu_usage': 'Warn if > 80% for 15 minutes',
+            'cache_hit_rate': 'Warn if < 85% for 30 minutes',
+            'disk_usage': 'Warn if > 75%',
+            'queue_depth': 'Warn if > 500 tasks'
+        },
+        
+        'info_alerts': {
+            'deployment_complete': 'Notify on successful deployment',
+            'backup_complete': 'Daily backup success'
+        }
+    },
+    
+    'slo_sla_tracking': {
+        'service_level_objectives': {
+            'api_availability': 'Target 99.9% monthly uptime',
+            'api_latency': 'Target 95% of requests < 200ms',
+            'data_consistency': 'Target 99.99% accuracy (1 error per 10,000)'
+        },
+        
+        'error_budget': {
+            'calculation': '100% - uptime_target = 0.1% (43.8 min/month)',
+            'usage': 'If budget exhausted: freeze features, focus on stability',
+            'reporting': 'Weekly error budget burn rate'
+        }
+    }
+}
+```
+
+---
+
+## 10. IMPLEMENTATION ROADMAP - 24 SPRINTS
+
+### 10.1 Phase 1: Foundation (Sprints 1-6)
+
+#### Sprint 1-2: Infrastructure & Project Setup
+**Duration**: 2 weeks  
+**Team**: 2 DevOps, 2 Backend, 1 Frontend  
+**Validation Gate**: Security audit passed
+
+- [ ] AWS account setup with multi-AZ VPC
+- [ ] PostgreSQL RDS with replicas and backups
+- [ ] Redis ElastiCache cluster
+- [ ] Basic Django project scaffolding with Docker
+- [ ] CI/CD pipeline (GitHub Actions + ArgoCD)
+- [ ] Basic authentication system (User model, JWT)
+- [ ] Admin dashboard setup (Django Admin + Jazzmin)
+- [ ] Environment variables and secrets management
+- [ ] Development, staging, production environments
+- [ ] Logging and monitoring infrastructure (CloudWatch initial)
+
+**Success Criteria**:
+- ✅ All environments operational
+- ✅ Database connections working with pgBouncer
+- ✅ CI/CD pipeline executes in < 10 minutes
+- ✅ Security baseline scan passed (no critical findings)
+
+#### Sprint 3-4: Core Models & Multi-Tenant Architecture
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 DBA, 1 QA  
+**Validation Gate**: Database migration successful, RLS tests passed
+
+- [ ] Company model with UEN validation
+- [ ] User model with role management
+- [ ] Product and variant models
+- [ ] Inventory location model
+- [ ] Order and order item models
+- [ ] Multi-tenant isolation (RLS policies)
+- [ ] Database indexes and performance tuning
+- [ ] API authentication (JWT) implementation
+- [ ] Unit test framework setup (pytest)
+- [ ] Initial seed data script
+
+**Success Criteria**:
+- ✅ All core models created with proper constraints
+- ✅ RLS tests pass: user cannot access other company data
+- ✅ Unit test coverage > 80% for models
+- ✅ Database migrations reversible (tested)
+
+#### Sprint 5-6: Basic E-Commerce APIs
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 Frontend, 1 QA  
+**Validation Gate**: API tests pass, integration with Stripe sandbox
+
+- [ ] Product catalog API (list, create, update, delete)
+- [ ] Shopping cart API (add, remove, update quantities)
+- [ ] Customer registration and authentication
+- [ ] Order creation API
+- [ ] Stripe integration for card payments
+- [ ] Basic inventory allocation logic
+- [ ] API documentation (Swagger/OpenAPI)
+- [ ] Postman test collection
+- [ ] Integration tests for checkout flow
+- [ ] Basic error handling and logging
+
+**Success Criteria**:
+- ✅ End-to-end order creation via API
+- ✅ Payment processing successful (Stripe test mode)
+- ✅ API response times < 200ms (p95)
+- ✅ Integration tests pass with 90% coverage
+
+### 10.2 Phase 2: E-Commerce Core (Sprints 7-12)
+
+#### Sprint 7-8: Frontend Web Storefront
+**Duration**: 2 weeks  
+**Team**: 3 Frontend, 1 UX Designer, 1 QA  
+**Validation Gate**: Lighthouse score > 90
+
+- [ ] Next.js project setup with Tailwind CSS
+- [ ] Product listing page with filters and search
+- [ ] Product detail page with gallery
+- [ ] Shopping cart component
+- [ ] Checkout flow (customer info, shipping, payment)
+- [ ] Mobile responsive design
+- [ ] PWA setup (service worker, manifest)
+- [ ] SEO optimization (meta tags, structured data)
+- [ ] Performance optimization (image lazy loading, code splitting)
+- [ ] Google Lighthouse audit
+
+**Success Criteria**:
+- ✅ Lighthouse performance score > 90 (mobile)
+- ✅ Cross-browser compatibility (Chrome, Safari, Firefox)
+- ✅ Mobile responsiveness validated on 3 device sizes
+- ✅ Page load time < 2s on 4G
+
+#### Sprint 9-10: Inventory Management Core
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 Mobile Dev, 1 QA  
+**Validation Gate**: 100 SKUs test, real-time updates verified
+
+- [ ] Multi-location inventory tracking
+- [ ] Stock level API (get, update)
+- [ ] Barcode scanning React Native app
+- [ ] Reorder point calculation
+- [ ] Stock movement audit trail
+- [ ] Mobile app for warehouse scanning
+- [ ] Real-time inventory sync
+- [ ] Integration tests for stock updates
+- [ ] Performance tests (100 concurrent updates)
+
+**Success Criteria**:
+- ✅ Inventory updates reflect across all channels in < 1s
+- ✅ Barcode scanning accuracy > 99% (tested with 100 SKUs)
+- ✅ Mobile app works offline and syncs when online
+- ✅ No inventory over-selling in load test
+
+#### Sprint 11-12: Singapore Payment Integration
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 Frontend, 1 DevOps  
+**Validation Gate**: PayNow working in test mode, HitPay integration complete
+
+- [ ] HitPay API integration (PayNow QR, GrabPay)
+- [ ] PayNow QR generation for invoices
+- [ ] webhook handling for payment confirmation
+- [ ] Payment reconciliation logic
+- [ ] Payment retry and failure handling
+- [ ] Express checkout (Apple Pay, Google Pay)
+- [ ] Multi-currency conversion
+- [ ] Payment dashboard for finance team
+- [ ] Payment method management for customers
+
+**Success Criteria**:
+- ✅ PayNow payment successful in test mode
+- ✅ Webhook receives and processes payment confirmation
+- ✅ Payment record created and linked to order
+- ✅ Refund processing works end-to-end
+
+### 10.3 Phase 3: Inventory & Accounting (Sprints 13-18)
+
+#### Sprint 13-14: Advanced Inventory Features
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 Data Scientist, 1 QA  
+**Validation Gate**: Demand forecasting accuracy > 80%
+
+- [ ] Demand forecasting model (ML-based)
+- [ ] ABC analysis for inventory classification
+- [ ] GMROI calculation
+- [ ] Reorder automation (auto-generate PO recommendations)
+- [ ] Multi-location transfer orders
+- [ ] Cycle counting workflow
+- [ ] Dead stock identification
+- [ ] Inventory aging reports
+- [ ] Purchase order creation API
+- [ ] Supplier catalog integration
+
+**Success Criteria**:
+- ✅ Demand forecast accuracy > 80% (tested on historical data)
+- ✅ Reorder point calculations align with historical demand patterns
+- ✅ Cycle counting workflow reduces variance to < 1%
+- ✅ No manual intervention needed for 90% of reorder recommendations
+
+#### Sprint 15-16: Accounting Core & GST
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 Accountant (consultant), 1 QA  
+**Validation Gate**: GST calculation accuracy 100% on test transactions
+
+- [ ] Chart of Accounts (SSCA compliance)
+- [ ] Journal entry API
+- [ ] Double-entry validation
+- [ ] GST calculation engine (9%)
+- [ ] GST F5 report generation
+- [ ] GST transaction classification (SR, ZR, EX)
+- [ ] Zero-rating logic for exports
+- [ ] Xero API integration (two-way sync)
+- [ ] Bank reconciliation draft
+- [ ] Accounting dashboard
+
+**Success Criteria**:
+- ✅ GST calculation accuracy 100% (100 test transactions)
+- ✅ F5 report balances correctly (Box 4 = 1+2+3, Box 8 = 6-7)
+- ✅ Journal entries balance (debits = credits)
+- ✅ Xero sync creates matching transactions
+
+#### Sprint 17-18: Bank Integration & Reconciliation
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 DevOps (bank API specialist), 1 QA  
+**Validation Gate**: Bank feed working for DBS/OCBC test accounts
+
+- [ ] DBS IDEAL API integration
+- [ ] OCBC API integration
+- [ ] Bank statement retrieval
+- [ ] Transaction auto-matching (rules-based)
+- [ ] Exception handling for unmatched transactions
+- [ ] Manual reconciliation interface
+- [ ] Cash flow forecasting
+- [ ] Payment reminders for receivables
+- [ ] Aging reports
+
+**Success Criteria**:
+- ✅ Bank feed retrieves transactions within 24 hours
+- ✅ Auto-matching accuracy > 85% (tested on 100 transactions)
+- ✅ Manual match interface intuitive (usability test)
+- ✅ Cash flow forecast within 10% of actual
+
+### 10.4 Phase 4: Singapore Compliance & Features (Sprints 19-24)
+
+#### Sprint 19-20: PayNow & Local Payments
+**Duration**: 2 weeks  
+**Team**: 2 Backend, 1 Frontend, 1 QA  
+**Validation Gate**: PayNow QR scanning working on mobile
+
+- [ ] PayNow QR generation for invoices
+- [ ] PayNow webhook integration
+- [ ] GrabPay, ShopeePay integration via HitPay
+- [ ] QR code display in checkout
+- [ ] PayNow payment verification
+- [ ] Instant payment notification
+- [ ] Mobile-optimized payment flow
+- [ ] BNPL options (Atome)
+
+**Success Criteria**:
+- ✅ PayNow payment successful end-to-end
+- ✅ QR code displays correctly on mobile
+- ✅ Payment verification < 5 seconds after customer pays
+- ✅ Webhook processing handles concurrent payments
+
+#### Sprint 21-22: PDPA Compliance & Security
+**Duration**: 2 weeks  
+**Team**: 1 Backend, 1 Security Engineer, 1 QA  
+**Validation Gate**: Security penetration test passed
+
+- [ ] Consent management system
+- [ ] Data access request workflow
+- [ ] Data deletion workflow
+- [ ] Privacy policy generation
+- [ ] Cookie consent banner
+- [ ] Security audit (code review)
+- [ ] Penetration testing
+- [ ] Vulnerability fixing
+- [ ] Security hardening (CSP headers, etc.)
+
+**Success Criteria**:
+- ✅ Penetration test findings all remediated (critical/high)
+- ✅ Consent records stored immutably
+- ✅ Data export generates complete report in < 5 minutes
+- ✅ Security headers implemented and verified
+
+#### Sprint 23-24: Go-Live Preparation & Deployment
+**Duration**: 2 weeks  
+**Team**: All teams  
+**Validation Gate**: Production deployment successful, 100 SMBs onboarded
+
+- [ ] Final performance optimization
+- [ ] Load testing (1000 concurrent users)
+- [ ] Security hardening
+- [ ] Production deployment (AWS Singapore)
+- [ ] Data migration from beta customers
+- [ ] Staff training documentation
+- [ ] Customer onboarding workflow
+- [ ] Marketing website launch
+- [ ] First 100 SMB customer onboarding
+- [ ] Post-launch monitoring and support
+
+**Success Criteria**:
+- ✅ Production deployment successful with zero downtime
+- ✅ Load test passes (1000 concurrent users, < 500ms P99)
+- ✅ 100 SMBs successfully onboarded
+- ✅ Zero critical incidents in first week
+
+---
+
+## 11. QUALITY ASSURANCE & TESTING STRATEGY
+
+### 11.1 Testing Framework & Coverage
+```python
+testing_strategy = {
+    'unit_tests': {
+        'framework': 'pytest 7.4 with pytest-django',
+        'coverage_target': '> 80% for business logic',
+        'file_structure': 'tests/unit/test_*.py',
+        'execution': 'On every PR via GitHub Actions',
+        'speed': '< 5 minutes for full suite',
+        'mocking': 'pytest-mock for external services',
+        
+        'example_test': '''
+            def test_calculate_gst():
+                product = Product(base_price=100, gst_type='standard_rated')
+                assert product.calculate_gst() == 9.00
+                
+            @pytest.mark.parametrize("gst_type,expected", [
+                ("standard_rated", 9.00),
+                ("zero_rated", 0.00),
+                ("exempt", None),
+            ])
+            def test_gst_types(gst_type, expected):
+                product = Product(gst_type=gst_type)
+                assert product.calculate_gst() == expected
+        '''
+    },
+    
+    'integration_tests': {
+        'framework': 'pytest with Django TestClient',
+        'coverage_target': '> 60% for API endpoints',
+        'file_structure': 'tests/integration/test_*.py',
+        'database': 'Test with PostgreSQL (not SQLite)',
+        'external_apis': 'Mock with responses or pytest-mock',
+        
+        'test_categories': [
+            'Checkout flow end-to-end',
+            'Payment gateway integration',
+            'Xero accounting sync',
+            'Inventory multi-location sync',
+            'Webhook handling'
+        ],
+        
+        'example_test': '''
+            def test_checkout_flow_with_inventory(self):
+                # Setup
+                product = create_product(stock=5)
+                customer = create_customer()
+                
+                # Execute
+                response = self.client.post('/api/v1/orders/', {
+                    'customer': customer.id,
+                    'items': [{'product': product.id, 'quantity': 2}]
+                })
+                
+                # Verify
+                assert response.status_code == 201
+                assert Order.objects.count() == 1
+                assert inventory_stock(product).quantity_available == 3
+        '''
+    },
+    
+    'e2e_tests': {
+        'framework': 'Cypress 13.0',
+        'coverage_target': 'All critical user journeys',
+        'file_structure': 'cypress/e2e/*.cy.js',
+        'execution': 'Nightly on staging environment',
+        
+        'test_scenarios': {
+            'customer_journey': [
+                'Browse products → Add to cart → Checkout → Pay → Receive confirmation',
+                'Account registration → Login → View order history → Request return',
+                'Apply voucher → Check discount → Complete payment',
+                'Search products → Filter → Sort → Add to wishlist'
+            ],
+            'admin_journey': [
+                'Login → Create product → Set price → Publish',
+                'View orders → Process payment → Fulfil order → Generate invoice',
+                'Run inventory report → Identify low stock → Create PO',
+                'Generate GST F5 → Submit to IRAS'
+            ],
+            'warehouse_staff_journey': [
+                'Receive shipment → Scan barcodes → Verify quantities → Accept',
+                'View pick list → Pick items → Scan → Pack → Print label',
+                'Perform cycle count → Adjust stock → Submit for approval'
+            ]
+        },
+        
+        'mobile_app_testing': {
+            'framework': 'Appium or Detox',
+            'devices': [
+                'iPhone 14 (iOS 17)',
+                'Samsung Galaxy S23 (Android 13)',
+                'iPad Air',
+                'Samsung Galaxy Tab'
+            ],
+            'test_scenarios': [
+                'Scan barcode to add to cart',
+                'PayNow QR payment',
+                'Push notification interaction'
+            ]
+        },
+        
+        'accessibility_testing': {
+            'tool': 'axe-core (Cypress plugin)',
+            'target': 'WCAG 2.1 AA compliance',
+            'checks': [
+                'Color contrast ratio > 4.5:1',
+                'All images have alt text',
+                'Keyboard navigation works',
+                'Screen reader compatibility'
+            ]
+        }
+    },
+    
+    'performance_tests': {
+        'tool': 'Locust 2.17',
+        'scenarios': {
+            'steady_state': {
+                'users': 1000,
+                'duration': '30 minutes',
+                'ramp_up': '5 minutes',
+                'actions': [
+                    'Browse 5 product pages',
+                    'Add 2 items to cart',
+                    'Checkout (100% payment success)'
+                ],
+                'success_criteria': 'P95 latency < 500ms, error rate < 0.1%'
+            },
+            
+            'flash_sale': {
+                'users': 5000,
+                'duration': '10 minutes',
+                'spike_pattern': '2000 users in first 30 seconds',
+                'actions': [
+                    'View flash sale banner',
+                    'Select limited-quantity item',
+                    'Complete checkout in < 2 minutes'
+                ],
+                'success_criteria': 'No overselling, inventory accuracy 100%'
+            },
+            
+            'admin_reporting': {
+                'users': 50,
+                'actions': [
+                    'Generate P&L report for last quarter',
+                    'Export GST transactions',
+                    'Bulk update 1000 products'
+                ],
+                'success_criteria': 'Report generation < 5 seconds, no timeout errors'
+            }
+        },
+        
+        'continuous_load_testing': {
+            'frequency': 'Weekly on staging',
+            'baseline': 'Compare with previous runs',
+            'regression_tolerance': 'P95 latency increase > 20% = regression'
+        }
+    },
+    
+    'security_tests': {
+        'static_analysis': {
+            'tools': ['Snyk', 'Bandit'],
+            'pipeline_integration': 'Block PR if critical/high findings',
+            'frequency': 'On every commit'
+        },
+        
+        'dependency_scanning': {
+            'tools': ['Snyk', 'npm audit'],
+            'vulnerability_db': 'Updated daily',
+            'action': 'Update or patch within 7 days'
+        },
+        
+        'dynamic_scanning': {
+            'tool': 'OWASP ZAP',
+            'frequency': 'Weekly',
+            'scans': [
+                'Spider crawl',
+                'Active scan (medium)',
+                'Authenticated scan',
+                'API scan (OpenAPI spec)'
+            ],
+            'fail_threshold': 'High or Critical alerts = fail build'
+        },
+        
+        'penetration_testing': {
+            'frequency': 'Quarterly',
+            'scope': 'External network, web app, API, mobile app',
+            'methodology': 'OWASP Testing Guide, PTES',
+            'report': 'Findings with risk rating and remediation steps',
+            'retest': 'Verify fixes within 30 days'
+        }
+    },
+    
+    'compliance_tests': {
+        'gst_compliance': {
+            'test_data': '100 sample transactions with known GST amounts',
+            'assertions': [
+                'Standard-rated items calculate 9% GST correctly',
+                'Zero-rated exports show 0% GST',
+                'F5 report balances correctly'
+            ],
+            'coverage': 'All GST scenarios in test suite'
+        },
+        
+        'pdpa_compliance': {
+            'tests': [
+                'Consent withdrawal stops data processing',
+                'Data export contains all customer data',
+                'Data deletion removes from DB and backups within 90 days',
+                'Audit trail records all data access'
+            ]
+        },
+        
+        'accessibility': {
+            'standard': 'WCAG 2.1 AA',
+            'tools': ['axe-core', 'Lighthouse', 'WAVE'],
+            'automated_tests': 'Run on every PR',
+            'manual_testing': 'Quarterly with assistive technology users'
+        }
+    },
+    
+    'test_data_management': {
+        'generation': {
+            'tool': 'Factory Boy + Faker',
+            'fixtures': 'Django fixtures for common scenarios',
+            'docker': 'Database container with seed data for local dev',
+            'anonymization': 'Production data anonymization script'
+        },
+        
+        'maintenance': {
+            'cleanup': 'Delete test data after test run',
+            'isolation': 'Each test gets clean database (transaction rollback)',
+            'parallelism': 'Use separate test databases for parallel test execution'
+        }
+    },
+    
+    'quality_gates': {
+        'pre_merge': [
+            'All unit tests pass',
+            'Coverage > 80%',
+            'No linting errors',
+            'Security scan passed (no critical/high)',
+            'Code review approved'
+        ],
+        
+        'pre_deployment_staging': [
+            'All integration tests pass',
+            'E2E tests pass',
+            'Performance tests pass (within baseline)',
+            'Security scan passed'
+        ],
+        
+        'pre_deployment_production': [
+            'All tests pass on staging',
+            'Performance tests pass (including load test)',
+            'Penetration test passed (if quarterly due)',
+            'Compliance tests passed',
+            'Change approval from tech lead'
+        ]
+    }
+}
+```
+
+### 11.2 Quality Assurance Process
+```python
+qa_process = {
+    'definition_of_done': {
+        'functional_requirements': 'All acceptance criteria met',
+        'testing': 'Unit, integration, and E2E tests pass',
+        'code_quality': 'Reviewed, linted, no TODOs',
+        'documentation': 'API docs updated, user docs updated',
+        'performance': 'Meets SLA (response time, throughput)',
+        'security': 'Security review passed',
+        'accessibility': 'WCAG 2.1 AA compliant',
+        'deployment': 'Deployable with one-click, rollback tested'
+    },
+    
+    'bug_severity': {
+        'critical': {
+            'definition': 'System down, data loss, security breach',
+            'response_time': 'Immediate (P1 alert)',
+            'fix_time': '4 hours',
+            'example': 'Payment processing down, customer data exposed'
+        },
+        'high': {
+            'definition': 'Major feature broken, workaround difficult',
+            'response_time': '1 hour',
+            'fix_time': '24 hours',
+            'example': 'Checkout crashes on mobile, inventory sync failing'
+        },
+        'medium': {
+            'definition': 'Feature partially broken, workaround exists',
+            'response_time': '4 hours',
+            'fix_time': '7 days',
+            'example': 'Search results inaccurate, invoice PDF formatting issue'
+        },
+        'low': {
+            'definition': 'Minor issue, cosmetic',
+            'response_time': '24 hours',
+            'fix_time': 'Next sprint',
+            'example': 'Typo in error message, button misaligned'
+        }
+    },
+    
+    'release_management': {
+        'versioning': 'Semantic versioning (v1.2.3)',
+        'release_notes': 'Auto-generated from merged PRs',
+        'rollout_strategy': {
+            'canary': 'Deploy to 10% of servers first',
+            'monitoring': 'Watch metrics for 30 minutes',
+            'progressive_rollout': '10% → 50% → 100% (if healthy)',
+            'rollback': 'One-click rollback if error rate > 1%'
+        },
+        'maintenance_windows': 'Sundays 2-4 AM (announce 7 days ahead)'
+    },
+    
+    'continuous_improvement': {
+        'retrospectives': 'Every sprint',
+        'metrics_review': 'Weekly',
+        'customer_feedback': 'Analyzed monthly',
+        'tech_debt_grooming': 'Every sprint (20% capacity)'
+    }
+}
+```
+
+---
+
+## 12. SUCCESS METRICS & KPI DASHBOARD
+
+### 12.1 Business Outcome Metrics
+```python
+success_kpis = {
+    'customer_acquisition': {
+        'metric': 'Number of active SMB customers',
+        'target': {
+            'm3': 50,
+            'm6': 100,
+            'm12': 500,
+            'm24': 2000
+        },
+        'measurement': 'Daily from database',
+        'visualization': 'Cumulative growth chart'
+    },
+    
+    'customer_satisfaction': {
+        'nps': {
+            'metric': 'Net Promoter Score',
+            'target': '> 50',
+            'survey': 'Quarterly to all users',
+            'question': 'How likely are you to recommend to other SMB owners?'
+        },
+        'csat': {
+            'metric': 'Customer Satisfaction Score',
+            'target': '> 4.5 / 5.0',
+            'survey': 'After key interactions (checkout, support resolution)'
+        },
+        'retention': {
+            'metric': 'Monthly Active Users (MAU) / Total Customers',
+            'target': '> 85%',
+            'calculation': 'Users who log in and perform meaningful action in month'
+        }
+    },
+    
+    'time_to_value': {
+        'onboarding': {
+            'metric': 'Days from signup to first order',
+            'target': '< 3 days',
+            'benchmark': 'Industry average 7 days'
+        },
+        'roi_realization': {
+            'metric': 'Days until customer reports time savings',
+            'target': '< 30 days',
+            'measurement': 'Survey question: "When did you start seeing time savings?"'
+        }
+    },
+    
+    'business_impact_delivered': {
+        'time_saved': {
+            'metric': 'Hours per week saved per customer',
+            'target': '> 10 hours/week',
+            'measurement': 'Survey + app analytics (manual task time reduction)'
+        },
+        'gst_errors_eliminated': {
+            'metric': '% of customers with zero GST penalties',
+            'target': '> 95%',
+            'baseline': 'Industry average: 60% have penalties'
+        },
+        'inventory_accuracy': {
+            'metric': 'Average inventory accuracy per customer',
+            'target': '> 99.5%',
+            'measurement': 'Cycle count variance'
+        }
+    }
+}
+```
+
+### 12.2 Technical Performance Metrics
+```python
+technical_kpis = {
+    'system_reliability': {
+        'uptime': {
+            'metric': 'Monthly uptime percentage',
+            'target': '> 99.9%',
+            'measurement': 'Pingdom from 5 locations',
+            'calculation': '(Total minutes - Downtime minutes) / Total minutes * 100'
+        },
+        'mean_time_to_recovery': {
+            'metric': 'MTTR for P1 incidents',
+            'target': '< 30 minutes',
+            'measurement': 'From incident detection to resolution'
+        },
+        'error_rate': {
+            'metric': '5xx errors / Total requests',
+            'target': '< 0.1%',
+            'measurement': 'From ALB access logs'
+        }
+    },
+    
+    'performance': {
+        'api_latency': {
+            'metric': 'P95 response time',
+            'target': '< 200ms',
+            'endpoints': 'Critical: checkout, payment, inventory check'
+        },
+        'page_load': {
+            'metric': 'Lighthouse performance score',
+            'target': '> 90',
+            'pages': 'Home, product list, product detail, checkout'
+        },
+        'database_query_time': {
+            'metric': 'Average query duration',
+            'target': '< 50ms',
+            'measurement': 'From pg_stat_statements'
+        }
+    },
+    
+    'scalability': {
+        'concurrent_users': {
+            'metric': 'Peak concurrent users supported',
+            'target': '> 1000',
+            'measurement': 'Load test (Locust)'
+        },
+        'orders_per_hour': {
+            'metric': 'Peak order processing rate',
+            'target': '> 1000 orders/hour',
+            'measurement': 'Load test during flash sale scenario'
+        },
+        'vertical_scalability': {
+            'metric': 'Traffic increase before performance degrades',
+            'target': '2x current peak traffic',
+            'measurement': 'Incremental load testing'
+        }
+    },
+    
+    'security': {
+        'vulnerabilities': {
+            'metric': 'Count of open high/critical security issues',
+            'target': '0 critical, < 3 high',
+            'tracking': 'Snyk dashboard'
+        },
+        'patch_lag': {
+            'metric': 'Days from CVE disclosure to patch deployment',
+            'target': '< 7 days for critical',
+            'measurement': 'From CVE release date to prod deployment'
+        },
+        'incidents': {
+            'metric': 'Number of security incidents per quarter',
+            'target': '0',
+            'definition': 'Confirmed breach or unauthorized access'
+        }
+    }
+}
+```
+
+### 12.3 Product Adoption & Engagement Metrics
+```python
+product_kpis = {
+    'feature_adoption': {
+        'inventory_scanning': {
+            'metric': '% of customers using mobile scanning',
+            'target': '> 60% by M6',
+            'measurement': 'In-app usage analytics'
+        },
+        'bank_reconciliation': {
+            'metric': '% of customers using auto-reconciliation',
+            'target': '> 70% by M6',
+            'measurement': 'API calls to bank integration'
+        },
+        'paynow_usage': {
+            'metric': '% of orders paid via PayNow',
+            'target': '> 40% by M6',
+            'measurement': 'Payment method distribution'
+        }
+    },
+    
+    'usage_frequency': {
+        'daily_active_users': {
+            'metric': 'DAU / Total customers',
+            'target': '> 50%',
+            'measurement': 'Login events'
+        },
+        'session_duration': {
+            'metric': 'Average session length (minutes)',
+            'target': '> 15 minutes',
+            'measurement': 'Frontend analytics'
+        },
+        'feature_depth': {
+            'metric': 'Average number of features used per session',
+            'target': '> 5',
+            'measurement': 'Intercom or Mixpanel'
+        }
+    },
+    
+    'user_support': {
+        'ticket_volume': {
+            'metric': 'Support tickets per 100 customers/month',
+            'target': '< 10',
+            'measurement': 'Zendesk'
+        },
+        'first_contact_resolution': {
+            'metric': '% of tickets resolved in first response',
+            'target': '> 80%',
+            'measurement': 'Zendesk'
+        },
+        'time_to_resolution': {
+            'metric': 'Average time to resolve ticket',
+            'target': '< 4 hours (P1), < 24 hours (P2)',
+            'measurement': 'Zendesk'
+        }
+    }
+}
+```
+
+### 12.4 Financial & ROI Metrics
+```python
+financial_kpis = {
+    'company_metrics': {
+        'monthly_recurring_revenue': {
+            'metric': 'MRR',
+            'targets': {
+                'm6': 'S$50,000',
+                'm12': 'S$250,000',
+                'm24': 'S$1,000,000'
+            },
+            'calculation': 'Sum of (active customers × plan price)'
+        },
+        'gross_mrr_churn': {
+            'metric': 'MRR lost / MRR at start of period',
+            'target': '< 5% monthly',
+            'industry_benchmark': '3-5% for SMB SaaS'
+        },
+        'customer_lifetime_value': {
+            'metric': 'Average revenue per customer over lifetime',
+            'target': '> S$24,000',
+            'calculation': 'ARPU × Average customer lifespan (24 months)'
+        },
+        'customer_acquisition_cost': {
+            'metric': 'Total sales & marketing spend / New customers',
+            'target': '< S$1,500',
+            'payback_period': '< 6 months'
+        }
+    },
+    
+    'platform_economics': {
+        'gross_margin': {
+            'metric': '(MRR - COGS) / MRR',
+            'target': '> 75%',
+            'cogs': 'Cloud infrastructure, payment gateway fees, support costs'
+        },
+        'unit_economics': {
+            'metric': 'Contribution margin per customer',
+            'target': '> S$400/month',
+            'calculation': 'Plan price - (infrastructure + support + payment fees)'
+        }
+    }
+}
+```
+
+---
+
+## 13. BUDGET & RESOURCE PLANNING
+
+### 13.1 Development Budget (24 months)
+```python
+budget_breakdown = {
+    'personnel': {
+        'description': 'Salary, benefits, ESOP',
+        'month_0_12': {
+            'ceo_founder': 120_000,
+            'cto_founder': 120_000,
+            'backend_engineers': 300_000,  # 3 engineers × S$100k
+            'frontend_engineers': 200_000,  # 2 engineers × S$100k
+            'mobile_developer': 100_000,
+            'devops_engineer': 120_000,
+            'qa_engineer': 90_000,
+            'product_manager': 120_000,
+            'designer': 80_000,
+            'total': 1_350_000
+        },
+        'month_13_24': {
+            'increment': '+2 backend, +1 mobile, +1 tech support',
+            'total': 1_800_000
+        }
+    },
+    
+    'technology_infrastructure': {
+        'month_0_12': {
+            'aws_cloud': 180_000,
+            'third_party_services': 60_000,
+            'licenses_tools': 30_000,
+            'total': 270_000
+        },
+        'month_13_24': {
+            'increment': 'Scale with customer growth',
+            'total': 420_000
+        }
+    },
+    
+    'professional_services': {
+        'legal_compliance': 80_000,
+        'accounting_audit': 40_000,
+        'penetration_testing': 60_000,
+        'iso_certification': 30_000,
+        'total_year_1': 210_000,
+        'total_year_2': 120_000
+    },
+    
+    'marketing_sales': {
+        'month_0_12': {
+            'digital_marketing': 100_000,
+            'content_creation': 40_000,
+            'events_sponsorships': 30_000,
+            'sales_team': 100_000,
+            'total': 270_000
+        },
+        'month_13_24': {
+            'increment': 'Scale based on CAC targets',
+            'total': 450_000
+        }
+    },
+    
+    'office_operations': {
+        'office_rent': 60_000,  # Co-working space for 10-15 people
+        'equipment': 30_000,
+        'utilities_internet': 12_000,
+        'insurance': 25_000,
+        'total_year_1': 127_000,
+        'total_year_2': 150_000
+    },
+    
+    'contingency': {
+        'percentage': 10,
+        'year_1': 223_700,
+        'year_2': 297_000
+    },
+    
+    'total_budget': {
+        'year_1': 'S$2,460,700',
+        'year_2': 'S$3,237,000',
+        'total_24_months': 'S$5,697,700'
+    }
+}
+```
+
+### 13.2 Resource Allocation Timeline
+```python
+resource_timeline = {
+    'month_0_3': {
+        'team_size': 8,
+        'focus': 'MVP development',
+        'key_resources': [
+            '2 Backend engineers (Django)',
+            '1 Frontend engineer (React)',
+            '1 Mobile developer (React Native)',
+            '1 DevOps engineer',
+            '1 QA engineer',
+            '1 Product manager',
+            '1 Designer'
+        ],
+        'budget': 'S$400,000 for 3 months'
+    },
+    
+    'month_4_6': {
+        'team_size': 10,
+        'focus': 'Beta launch and customer feedback',
+        'additions': [
+            '+1 Backend engineer',
+            '+1 Customer success',
+            '+0.5 Sales (part-time)'
+        ],
+        'budget': 'S$450,000 for 3 months'
+    },
+    
+    'month_7_12': {
+        'team_size': 15,
+        'focus': 'Scale to 100 customers',
+        'additions': [
+            '+2 Backend engineers',
+            '+1 Frontend engineer',
+            '+1 Mobile developer',
+            '+1 Tech support',
+            '+1 Sales executive',
+            '+1 Marketing executive'
+        ],
+        'budget': 'S$900,000 for 6 months'
+    },
+    
+    'month_13_24': {
+        'team_size': 25,
+        'focus': 'Scale to 500 customers, expand features',
+        'additions': [
+            '+2 Backend engineers',
+            '+2 Frontend engineers',
+            '+1 Mobile developer',
+            '+2 Tech support',
+            '+2 Sales executives',
+            '+1 Marketing manager',
+            '+1 Finance manager',
+            '+1 HR manager'
+        ],
+        'budget': 'S$2,947,700 for 12 months'
+    }
+}
+```
+
+### 13.3 Funding Strategy
+```python
+funding_plan = {
+    'initial_capital': {
+        'founders_investment': 'S$500,000',
+        'early_angel': 'S$500,000 (friends and family)',
+        'total': 'S$1,000,000'
+    },
+    
+    'seed_round': {
+        'timing': 'Month 6 (after MVP + first 10 customers)',
+        'target': 'S$2,000,000',
+        'use_of_funds': [
+            'Team expansion (+8 engineers)',
+            'Product development (payments, compliance)',
+            'Customer acquisition (S$50k/month marketing)',
+            'Working capital'
+        ],
+        'investor_profile': 'Enterprise software VCs, fintech-focused',
+        'valuation_expectation': 'S$8-10M pre-money'
+    },
+    
+    'series_a': {
+        'timing': 'Month 18 (at 500 customers)',
+        'target': 'S$5,000,000',
+        'use_of_funds': [
+            'Scale engineering team (from 15 to 30)',
+            'Sales and marketing scaling (S$200k/month)',
+            'International expansion (Malaysia, Indonesia)',
+            'Enterprise features (SOC 2, advanced analytics)'
+        ],
+        'investor_profile': 'Series A VCs with Southeast Asia focus',
+        'valuation_expectation': 'S$20-25M pre-money'
+    },
+    
+    'government_grants': {
+        'psg_allowance': {
+            'description': 'Productivity Solutions Grant',
+            'eligibility': 'SME customers can get up to S$30,000',
+            'benefit': '70% of our subscription cost reimbursed to customer',
+            'impact': 'Lowers customer acquisition cost'
+        },
+        'edgi_allowance': {
+            'description': 'Enterprise Development Grant',
+            'eligibility': 'For R&D and product development',
+            'potential': 'Up to 70% of project costs',
+            'application': 'Quarterly claims'
+        },
+        'startup_sg': {
+            'description': 'Startup SG Founder',
+            'potential': 'S$50,000 grant + mentorship',
+            'status': 'Founders to apply before company incorporation'
+        }
+    },
+    
+    'cash_flow_projection': {
+        'month_0_6': {
+            'burn_rate': 'S$400k/month',
+            'revenue': 'S$0-5k/month (beta customers)',
+            'runway': '2.5 months left at month 6'
+        },
+        'month_7_12': {
+            'burn_rate': 'S$650k/month',
+            'revenue': 'S$50k → S$250k/month',
+            'runway': '4 months left at month 12 (post-seed)'
+        },
+        'month_13_24': {
+            'burn_rate': 'S$1.2M/month',
+            'revenue': 'S$250k → S$800k/month',
+            'runway': '18 months (post-Series A)'
+        },
+        'profitability_target': 'Month 30 (2.5 years from start)'
+    }
+}
+```
+
+---
+
+## 14. RISK MANAGEMENT & BUSINESS CONTINUITY
+
+### 14.1 Risk Register & Mitigation
+```python
+risk_register = {
+    'technical_risks': [
+        {
+            'id': 'R-T-01',
+            'risk': 'Database performance degrades with 1000+ concurrent users',
+            'probability': 'medium',
+            'impact': 'high',
+            'mitigation': [
+                'Implement read replicas and pgBouncer',
+                'Add Redis caching layer',
+                'Plan for horizontal sharding (company_id)',
+                'Continuous performance monitoring'
+            ],
+            'contingency': 'If issue occurs: Vertical scale RDS, optimize queries, enable more caching',
+            'owner': 'CTO',
+            'status': 'mitigated'
+        },
+        {
+            'id': 'R-T-02',
+            'risk': 'Payment gateway downtime affects customer checkouts',
+            'probability': 'medium',
+            'impact': 'high',
+            'mitigation': [
+                'Implement multi-gateway failover (Stripe → HitPay → PayPal)',
+                'Graceful degradation: queue orders offline',
+                'Real-time monitoring and alerts'
+            ],
+            'contingency': 'If primary gateway down: Automatically switch to backup',
+            'owner': 'DevOps Lead',
+            'status': 'mitigated'
+        },
+        {
+            'id': 'R-T-03',
+            'risk': 'Security vulnerability leads to data breach',
+            'probability': 'low',
+            'impact': 'critical',
+            'mitigation': [
+                'Regular penetration testing',
+                'Bug bounty program',
+                'Security training for engineers',
+                'Intrusion detection system',
+                'Data encryption at rest and in transit'
+            ],
+            'contingency': '72-hour breach notification plan, cyber insurance',
+            'owner': 'Security Officer',
+            'status': 'monitored'
+        },
+        {
+            'id': 'R-T-04',
+            'risk': 'Third-party API changes break integration',
+            'probability': 'high',
+            'impact': 'medium',
+            'mitigation': [
+                'Abstract API calls behind interface',
+                'Monitor API deprecation notices',
+                'Maintain test accounts with all providers',
+                'Version pinning of API libraries'
+            ],
+            'contingency': 'If API deprecated: Implement fallback to other integration',
+            'owner': 'Backend Lead',
+            'status': 'monitored'
+        }
+    ],
+    
+    'business_risks': [
+        {
+            'id': 'R-B-01',
+            'risk': 'Customer acquisition cost higher than projected',
+            'probability': 'high',
+            'impact': 'high',
+            'mitigation': [
+                'PSG grant eligibility reduces customer cost by 70%',
+                'Freemium model to lower barrier',
+                'Strong referral program (S$200 credit)',
+                'Content marketing and SEO'
+            ],
+            'contingency': 'If CAC > 2x target: Reduce sales team, increase digital marketing',
+            'owner': 'CEO',
+            'status': 'monitored'
+        },
+        {
+            'id': 'R-B-02',
+            'risk': 'Competitor launches similar integrated platform',
+            'probability': 'medium',
+            'impact': 'high',
+            'mitigation': [
+                'First-mover advantage in Singapore compliance',
+                'Deep localization (PayNow, SingPass, IRAS)',
+                'Network effects with marketplace integrations',
+                'Continuous feature innovation'
+            ],
+            'contingency': 'Accelerate feature roadmap, focus on enterprise features',
+            'owner': 'CEO',
+            'status': 'monitored'
+        },
+        {
+            'id': 'R-B-03',
+            'risk': 'IRAS changes GST rules requiring platform updates',
+            'probability': 'medium',
+            'impact': 'medium',
+            'mitigation': [
+                'Modular GST engine design',
+                'Quarterly compliance review',
+                'Subscribe to IRAS updates',
+                '16% contingency budget'
+            ],
+            'contingency': 'If rule change: Emergency sprint within 30 days',
+            'owner': 'Compliance Officer',
+            'status': 'monitored'
+        },
+        {
+            'id': 'R-B-04',
+            'risk': 'Key technical staff departure delays product development',
+            'probability': 'medium',
+            'impact': 'medium',
+            'mitigation': [
+                'Cross-training and documentation',
+                'Competitive compensation + ESOP',
+                'Documentation-first culture',
+                'Vendor partnerships for knowledge transfer'
+            ],
+            'contingency': 'If key person leaves: Engage contractor/consultant',
+            'owner': 'CTO',
+            'status': 'monitored'
+        }
+    ],
+    
+    'financial_risks': [
+        {
+            'id': 'R-F-01',
+            'risk': 'Runway shortage before reaching profitability',
+            'probability': 'medium',
+            'impact': 'critical',
+            'mitigation': [
+                'Conservative burn rate management',
+                'Monthly cash flow forecasting',
+                'Early fundraising (6 months before need)',
+                'Revenue-based financing option'
+            ],
+            'contingency': 'If runway < 6 months: Reduce team size, focus on core customers',
+            'owner': 'CFO',
+            'status': 'monitored'
+        },
+        {
+            'id': 'R-F-02',
+            'risk': 'Currency fluctuation affects costs (AWS billed in USD)',
+            'probability': 'low',
+            'impact': 'low',
+            'mitigation': [
+                'Natural hedge: Some revenue in USD (international customers)',
+                'Forward contracts for large foreign expenses',
+                'Pricing in USD for international customers'
+            ],
+            'owner': 'CFO',
+            'status': 'monitored'
+        }
+    ]
+}
+```
+
+### 14.2 Business Continuity Plan
+```python
+business_continuity_plan = {
+    'disaster_recovery': {
+        'rto': 'Recovery Time Objective: < 4 hours',
+        'rpo': 'Recovery Point Objective: < 15 minutes',
+        
+        'scenarios': {
+            'database_corruption': {
+                'detection': 'Automated integrity checks',
+                'response': [
+                    'Switch to read replica',
+                    'Identify corruption source',
+                    'Restore from backup (last valid point)',
+                    'Replay transactions from WAL',
+                    'Validate data consistency'
+                ],
+                'mtd': 'Maximum tolerable downtime: 4 hours'
+            },
+            
+            'complete_data_center_outage': {
+                'trigger': 'AWS region failure (extremely rare)',
+                'response': [
+                    'Activate DR site in ap-southeast-2 (Sydney)',
+                    'Promote read replica in DR region',
+                    'Update DNS to point to DR ALB',
+                    'Restore from cross-region backup'
+                ],
+                'mtd': '24 hours'
+            },
+            
+            'ransomware_attack': {
+                'prevention': [
+                    'Immutable backups (S3 Object Lock)',
+                    'Endpoint protection on workstations',
+                    'Email filtering',
+                    'Security training'
+                ],
+                'response': [
+                    'Isolate affected systems',
+                    'Assess scope from backups',
+                    'Restore from last clean backup',
+                    'Harden security',
+                    'Notify authorities'
+                ],
+                'mtd': '4 hours (using backups from 15 minutes ago)'
+            },
+            
+            'key_person_unavailability': {
+                'mitigation': [
+                    'Cross-training documentation',
+                    'Pair programming for critical features',
+                    'Vendor support contracts',
+                    'Key person insurance'
+                ],
+                'response': [
+                    'Reassign tasks to backup personnel',
+                    'Engage contractors if needed',
+                    'Defer non-critical work'
+                ]
+            }
+        }
+    },
+    
+    'backup_strategy': {
+        'database': {
+            'frequency': 'Continuous WAL archiving + daily base backup',
+            'retention': '7 daily, 4 weekly, 12 monthly',
+            'storage': 'S3 with cross-region replication',
+            'encryption': 'AES-256',
+            'testing': 'Restore test every Sunday'
+        },
+        
+        'files': {
+            'frequency': 'Daily incremental',
+            'retention': '30 days',
+            'storage': 'S3 Glacier Deep Archive',
+            'encryption': 'Client-side AES-256'
+        },
+        
+        'configuration': {
+            'frequency': 'On every change',
+            'storage': 'Git repository + AWS Config',
+            'retention': 'Immutable history'
+        }
+    },
+    
+    'incident_response': {
+        'severity_levels': {
+            'p1_critical': {
+                'examples': [
+                    'Complete system outage',
+                    'Security breach confirmed',
+                    'Payment processing down',
+                    'Data corruption'
+                ],
+                'response_time': '5 minutes',
+                's assembled': '15 minutes',
+                'communication': 'Update customers every 30 minutes',
+                'resolution_target': '4 hours'
+            },
+            'p2_high': {
+                'examples': [
+                    'Major feature broken',
+                    'Performance severely degraded',
+                    'Multiple customers affected'
+                ],
+                'response_time': '15 minutes',
+                'resolution_target': '24 hours'
+            },
+            'p3_medium': {
+                'examples': [
+                    'Minor feature bug',
+                    'Single customer affected',
+                    'Performance degradation'
+                ],
+                'response_time': '1 hour',
+                'resolution_target': '7 days'
+            },
+            'p4_low': {
+                'examples': ['Cosmetic issues', 'Documentation errors'],
+                'response_time': '4 hours',
+                'resolution_target': 'Next sprint'
+            }
+        },
+        
+        'communication_plan': {
+            'internal': {
+                'p1': 'Slack #incidents + PagerDuty + Phone call to on-call',
+                'p2': 'Slack #incidents',
+                'p3': 'Jira ticket',
+                'p4': 'Jira ticket'
+            },
+            'external': {
+                'p1': 'Status page update + Email/SMS to affected customers',
+                'p2': 'Status page update',
+                'p3': 'Jira Service Desk ticket with customer',
+                'p4': 'Jira Service Desk ticket'
+            },
+            
+            'status_page': 'Hosted on separate infrastructure (status.sg-smb.com)',
+            'updates': 'Every 30 minutes for P1, hourly for P2',
+            'resolution': 'Final update with RCA after incident'
+        },
+        
+        'post_incident_review': {
+            'timeline': 'Within 48 hours of resolution',
+            'attendees': 'Engineering, product, customer success',
+            'topics': [
+                'What happened (timeline)',
+                'Why it happened (root cause)',
+                'What we did to fix',
+                'What we can do to prevent recurrence',
+                'Action items with owners and deadlines'
+            ],
+            'documentation': 'Public post-mortem on internal wiki',
+            'sharing': 'Share with entire company (no blame culture)'
+        }
+    }
+}
+```
+
+---
+
+## 15. FUTURE ROADMAP & VISION
+
+### 15.1 Vision 2027-2030
+```python
+product_vision = {
+    'mission': 'Empower 100,000 Southeast Asian SMBs with intelligent, compliant, and automated commerce',
+    
+    'pillars': {
+        'ai_powered_automation': {
+            'description': 'Transform from tool to intelligent business partner',
+            'capabilities': [
+                'AI demand forecasting with 95% accuracy',
+                'Automated pricing optimization',
+                'Predictive cash flow management',
+                'Smart inventory allocation across locations',
+                'Conversational AI for customer service'
+            ],
+            'impact': 'Reduce manual decision-making by 80%'
+        },
+        
+        'regional_expansion': {
+            'description': 'Expand beyond Singapore to Southeast Asia',
+            'markets': {
+                'malaysia': {
+                    'timeline': 'Q2 2026',
+                    'localization': [
+                        'SST (Sales and Service Tax) compliance',
+                        'Maybank, CIMB payment integration',
+                        'Malay language support',
+                        'GrabPay dominance'
+                    ]
+                },
+                'indonesia': {
+                    'timeline': 'Q4 2026',
+                    'localization': [
+                        'PPN (Pajak Pertambahan Nilai) compliance',
+                        'QRIS payment integration',
+                        'Indonesian language support',
+                        'Shopee dominance'
+                    ]
+                },
+                'thailand': {
+                    'timeline': 'Q2 2027',
+                    'localization': [
+                        'VAT compliance',
+                        'PromptPay integration',
+                        'Thai language support'
+                    ]
+                }
+            },
+            'impact': '10x customer base by 2028'
+        },
+        
+        'ecosystem_orchestration': {
+            'description': 'Become the central platform for SMB commerce ecosystem',
+            'integrations': {
+                'marketplaces': 'Native integration with all major SEA marketplaces (Shopee, Lazada, Tokopedia, Tiki)',
+                'logistics': 'Multi-carrier rate shopping, automated fulfillment',
+                'finance': 'Integrated lending, invoice financing, BNPL',
+                'marketing': 'AI-powered campaign optimization across channels',
+                'government': 'Direct API to all SEA tax authorities'
+            },
+            'platform_strategy': 'Partner ecosystem, not build everything'
+        },
+        
+        'sustainability_partner': {
+            'description': 'Help SMBs achieve ESG goals',
+            'features': [
+                'Carbon footprint tracking per shipment',
+                'Sustainable packaging recommendations',
+                'Supplier ESG scorecards',
+                'Green logistics options',
+                'ESG reporting for corporate customers'
+            ],
+            'partnerships': 'Green logistics, sustainable packaging suppliers'
+        }
+    },
+    
+    'technology_evolution': {
+        'monolith_to_microservices': {
+            'trigger': 'Team size > 25 engineers',
+            'timeline': '2027-2028',
+            'services': [
+                'Product catalog service',
+                'Inventory service',
+                'Order service',
+                'Payment service',
+                'Accounting service',
+                'Analytics service'
+            ]
+        },
+        
+        'edge_computing': {
+            'use_case': 'Ultra-low latency inventory for retail stores',
+            'deployment': 'Run inventory sync at store level',
+            'benefit': 'Works during internet outages'
+        },
+        
+        'quantum_ready': {
+            'timeline': '2029-2030',
+            'preparation': 'Ensure cryptography is quantum-resistant',
+            'use_case': 'Inventory optimization, fraud detection'
+        }
+    },
+    
+    'impact_goals': {
+        'economic': 'Help customers generate S$10B in combined revenue',
+        'social': 'Create 100,000 jobs in SMB sector',
+        'environmental': 'Reduce SMB carbon footprint by 20%',
+        'governance': 'Achieve 100% tax compliance rate among customers'
+    }
+}
+```
+
+### 15.2 Feature Roadmap (Post-MVP)
+```python
+feature_roadmap = {
+    'near_term_2025': {
+        'advanced_analytics': {
+            'ai_demand_forecasting': {
+                'description': 'ML models for inventory prediction',
+                'methods': ['Time series analysis', 'Regression', 'Neural networks'],
+                'accuracy_target': '> 85%',
+                'value': 'Reduce stockouts by 50%, reduce excess inventory by 30%'
+            },
+            'customer_lifetime_value': {
+                'description': 'Predictive CLV with churn risk scoring',
+                'factors': ['Purchase frequency', 'Recency, Monetary value', 'Support interactions'],
+                'actions': [
+                    'High value customers → Proactive outreach',
+                    'At-risk customers → Retention offers',
+                    'Low value → Self-service focus'
+                ]
+            },
+            'dynamic_pricing': {
+                'description': 'AI-powered price optimization',
+                'factors': [
+                    'Competitor prices',
+                    'Demand trends',
+                    'Inventory levels',
+                    'Customer willingness-to-pay'
+                ],
+                'optimization': 'Real-time price updates to maximize revenue'
+            }
+        },
+        
+        'b2b_enhancements': {
+            'credit_management': {
+                'features': [
+                    'Credit application workflow',
+                    'Credit limit management',
+                    'Payment terms automation',
+                    'Aging reports with collections automation'
+                ],
+                'integration': 'Credit bureau APIs'
+            },
+            'sales_rep_management': {
+                'features': [
+                    'Territory management',
+                    'Commission tracking',
+                    'Customer assignment',
+                    'Performance dashboards'
+                ],
+                'value': 'Enable field sales teams'
+            }
+        },
+        
+        'supply_chain_integration': {
+            'supplier_portal': {
+                'features': [
+                    'Supplier onboarding',
+                    'RFQ management',
+                    'Purchase order collaboration',
+                    'Invoice matching',
+                    'Supplier performance scorecard'
+                ],
+                'value': 'Streamline procurement process'
+            },
+            
+            'demand_planning': {
+                'features': [
+                    'Multi-location inventory optimization',
+                    'Safety stock calculation',
+                    'Replenishment automation',
+                    'Supplier allocation rules'
+                ],
+                'benefits': [
+                    'Reduce inventory holding cost by 20%',
+                    'Improve service level to 99.5%'
+                ]
+            }
+        }
+    },
+    
+    'medium_term_2026': {
+        'marketplace_expansion': {
+            'regional_marketplaces': [
+                'Tokopedia (Indonesia)',
+                'Bukalapak (Indonesia)',
+                'Tiki (Vietnam)',
+                'Zalora (Southeast Asia)'
+            ],
+            'features': [
+                'Unified inventory across all marketplaces',
+                'Centralized order management',
+                'Dynamic pricing per marketplace',
+                'Automated listing optimization'
+            ],
+            'value': 'Increase customer GMV by 40% through multi-channel sales'
+        },
+        
+        'advanced_compliance': {
+            'international_tax': {
+                'countries': ['Malaysia (SST)', 'Indonesia (PPN)', 'Thailand (VAT)'],
+                'features': [
+                    'Multi-country tax calculation',
+                    'Localized tax reporting',
+                    'Automated submissions',
+                    'Audit support packages'
+                ]
+            },
+            'carbon_accounting': {
+                'features': [
+                    'Carbon footprint per shipment',
+                    'Scope 3 emissions tracking',
+                    'ESG reporting templates',
+                    'Sustainable supplier recommendations'
+                ],
+                'regulation': 'Prepare for mandatory climate reporting'
+            }
+        },
+        
+        'financial_services': {
+            'integrated_lending': {
+                'partners': 'Validus, Funding Societies, Aspire',
+                'features': [
+                    'Eligibility assessment',
+                    'One-click loan application',
+                    'Repayment from sales proceeds',
+                    'Preferential rates for our customers'
+                ],
+                'value': 'Provide working capital to customers'
+            },
+            
+            'embedded_insurance': {
+                'products': [
+                    'Shipping insurance',
+                    'Product liability',
+                    'Business interruption'
+                ],
+                'model': 'Commission-based'
+            },
+            
+            'corporate_cards': {
+                'partnership': 'Yodlee for expense management',
+                'features': [
+                    'Virtual cards for purchases',
+                    'Automated expense categorization',
+                    'Integration with accounting'
+                ]
+            }
+        }
+    },
+    
+    'long_term_2027_plus': {
+        'ai_transformation': {
+            'conversational_commerce': {
+                'features': [
+                    'WhatsApp/SMS ordering',
+                    'AI customer service agent',
+                    'Voice commerce integration'
+                ],
+                'technology': 'GPT-4 or equivalent, fine-tuned'
+            },
+            
+            'autonomous_operations': {
+                'capabilities': [
+                    'AI negotiates with suppliers',
+                    'Auto-responds to customer inquiries',
+                    'Predictive maintenance alerts',
+                    'Dynamic staffing optimization'
+                ],
+                'goal': '80% of routine decisions automated'
+            },
+            
+            'predictive_analytics': {
+                'models': [
+                    'Churn prediction (30 days ahead)',
+                    'Demand forecasting (seasonal + trends)',
+                    'Fraud detection (real-time)',
+                    'Lifetime value optimization'
+                ],
+                'accuracy_target': '> 90%'
+            }
+        },
+        
+        'ecosystem_platform': {
+            'app_marketplace': {
+                'vision': 'Third-party developers build extensions',
+                'categories': [
+                    'Shipping plugins',
+                    'Accounting connectors',
+                    'Marketing automation',
+                    'Industry-specific features'
+                ],
+                'revenue_model': 'Revenue share 70/30'
+            },
+            
+            'open_api': {
+                'scope': 'Comprehensive API for all features',
+                'documentation': 'Interactive API explorer',
+                'sdk': 'Python, Node.js, PHP SDKs',
+                'webhooks': 'Extensive event coverage'
+            },
+            
+            'data_network': {
+                'concept': 'Anonymized industry insights',
+                'value': 'Benchmarking against peers',
+                'compliance': 'Full anonymization, opt-in only'
+            }
+        }
+    }
+}
+```
+
+---
+
+## APPENDICES
+
+### Appendix A: Technology Stack Deep Dive
+```yaml
+detailed_tech_stack:
+  backend:
+    django:
+      version: '5.0.0'
+      core_apps: [
+        'django.contrib.admin',
+        'django.contrib.auth',
+        'django.contrib.contenttypes',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles'
+      ]
+      custom_apps: [
+        'apps.core',
+        'apps.users',
+        'apps.companies',
+        'apps.products',
+        'apps.inventory',
+        'apps.orders',
+        'apps.payments',
+        'apps.accounting',
+        'apps.compliance',
+        'apps.analytics'
+      ]
+      middlewares: [
+        'django.middleware.security.SecurityMiddleware',
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'django.middleware.common.CommonMiddleware',
+        'django.middleware.csrf.CsrfViewMiddleware',
+        'django.contrib.auth.middleware.AuthenticationMiddleware',
+        'django.contrib.messages.middleware.MessageMiddleware',
+        'django.middleware.clickjacking.XFrameOptionsMiddleware',
+        'apps.core.middleware.CompanyMiddleware',
+        'apps.core.middleware.AuditMiddleware'
+      ]
+      database_routers: [
+        'apps.core.db_routers.PrimaryReplicaRouter'
+      ]
+      template_engine: 'DjangoTemplates with Jinja2 for complex logic'
+      
+    drf:
+      version: '3.14.0'
+      authentication_classes: [
+        'rest_framework.authentication.SessionAuthentication',
+        'dj_rest_auth.jwt_auth.JWTCookieAuthentication'
+      ]
+      permission_classes: [
+        'rest_framework.permissions.IsAuthenticated'
+      ]
+      pagination_class: 'rest_framework.pagination.CursorPagination'
+      renderer_classes: [
+        'rest_framework.renderers.JSONRenderer',
+        'rest_framework.renderers.BrowsableAPIRenderer'
+      ]
+      
+    celery:
+      version: '5.3.4'
+      broker: 'RabbitMQ 3.11'
+      result_backend: 'Redis 7.0'
+      timezone: 'Asia/Singapore'
+      task_serializer: 'json'
+      result_serializer: 'json'
+      concurrency: '4 worker processes per server'
+      worker_prefetch_multiplier: '1 (fair distribution)'
+      worker_max_tasks_per_child: '1000 (prevent memory leaks)'
+      
+      queues: {
+        'default': 'General tasks',
+        'high_priority': 'Order processing, payments',
+        'low_priority': 'Reports, analytics',
+        'inventory': 'Stock updates, transfers',
+        'accounting': 'Journal entries, GST',
+        'notifications': 'Email, SMS, push'
+      }
+      beat_schedule: {
+        'daily_reports': {
+          task: 'apps.analytics.tasks.generate_daily_reports',
+          schedule: '0 2 * * *'  # 2 AM daily
+        },
+        'inventory_reorder': {
+          task: 'apps.inventory.tasks.check_reorder_points',
+          schedule: '*/15 * * * *'  # Every 15 minutes
+        },
+        'gst_filing_reminder': {
+          task: 'apps.compliance.tasks.send_gst_reminders',
+          schedule: '0 9 25 * *'  # 9 AM on 25th of month
+        }
+      }
+```
+
+### Appendix B: API Reference Examples
+```python
+# Example 1: Create Order with Complete Flow
+POST /api/v1/orders/
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+X-Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+
+{
+  "customer_id": "cus_123",
+  "items": [
+    {
+      "product_sku": "DRS-WHT-001",
+      "quantity": 2,
+      "variant_id": "var_001"
+    }
+  ],
+  "shipping_address": {
+    "name": "Sarah Chen",
+    "address_line1": "123 Orchard Road",
+    "address_line2": "#05-01",
+    "postal_code": "238863",
+    "country": "SG"
+  },
+  "payment_method": "paynow",
+  "notes": "Gift message: Happy Birthday!",
+  "metadata": {
+    "campaign_source": "facebook_ad_123"
+  }
+}
+
+Response:
+201 Created
+Location: /api/v1/orders/ORD-2024-001234
+
+{
+  "order_number": "ORD-2024-001234",
+  "status": "pending_payment",
+  "payment_status": "pending",
+  "fulfillment_status": "pending",
+  "subtotal": 179.98,
+  "gst_amount": 16.20,
+  "total_amount": 196.18,
+  "payment_instructions": {
+    "method": "paynow",
+    "qr_code_url": "https://api.hitpay.com/qr/abc123.png",
+    "amount": 196.18,
+    "expiry": "2024-12-17T11:00:00+08:00"
+  },
+  "timeline": [
+    {
+      "status": "Order Placed",
+      "timestamp": "2024-12-17T10:30:00+08:00"
+    }
+  ]
+}
+```
+
+### Appendix C: Database Performance Metrics
+```sql
+-- Real-time inventory query (critical path)
+EXPLAIN ANALYZE
+SELECT 
+    p.sku,
+    p.name,
+    SUM(s.quantity_available) as total_available,
+    s.reorder_point
+FROM products p
+INNER JOIN inventory_stock s ON p.id = s.product_id
+WHERE p.company_id = 'comp_123'
+    AND p.is_active = TRUE
+    AND s.quantity_available < s.reorder_point
+GROUP BY p.sku, p.name, s.reorder_point
+ORDER BY total_available ASC;
+
+-- Expected execution plan with indexes:
+-- Index Scan using idx_products_company_active on products (cost=0.1..10.0 rows=1000)
+-- Bitmap Heap Scan using idx_stock_available on inventory_stock (cost=1.0..50.0 rows=50)
+-- GroupAggregate (cost=60..70 rows=45)
+-- Sort (cost=70..71 rows=45)
+-- Total cost: ~71, execution time: < 5ms
+
+-- GST report query
+EXPLAIN ANALYZE
+SELECT 
+    je.
