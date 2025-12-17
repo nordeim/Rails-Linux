@@ -12,6 +12,10 @@ Please think deeper and think harder to deeply explore thoroughly and systematic
 
 ---
 
+Awesome understanding! Now, please help me meticulously review and analyze three different submitted `Project Requirements Documents` that I will share with you in this and the next two prompts because of their length. Help me to meticulously and critically compare and critique them, also verify my own assessment report below.
+
+---
+
 Awesome job on your meticulous review, analysis and planning! Please keep up the good work in your rigorous and meticulous approach to planning and execution! Now, please meticulously plan and then create a comprehensive `Project Architecture Document` in markdown format. Again, create a detailed implementation plan for the PAD first, review and validate it before proceeding meticulously to execute it.
 
 ---
