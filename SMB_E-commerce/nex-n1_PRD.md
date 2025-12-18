@@ -1,16 +1,6 @@
 # **SINGAPORE SMB E-COMMERCE & INTEGRATED BUSINESS SYSTEM**
 ## **PROJECT REQUIREMENTS DOCUMENT**
 
----
-
-## **DOCUMENT CONTROL**
-
-| **Version** | **Date** | **Author** | **Changes** |
-|-------------|----------|------------|-------------|
-| 1.0 | 2025-01-15 | AI Development Team | Initial comprehensive requirements document |
-
----
-
 ## **1. EXECUTIVE SUMMARY**
 
 ### **1.1 Project Overview**
